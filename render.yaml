@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: stock-skills-chatgpt
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TUSHARE_TOKEN
+        sync: false
+      - key: API_SECRET
+        generateValue: true
+      - key: TAVILY_API_KEY
+        sync: false
