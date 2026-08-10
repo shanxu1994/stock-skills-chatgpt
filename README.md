@@ -28,10 +28,13 @@ uvicorn app.main:app --reload
 
 ## Render 部署
 
-1. 在 Render 选择 **New → Blueprint**，连接本仓库。
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/shanxu1994/stock-skills-chatgpt)
+
+1. 点击上方按钮并使用 GitHub 登录 Render。
 2. 设置 Secret：`TUSHARE_TOKEN`；可选设置 `TAVILY_API_KEY`。
-3. 部署完成后记录服务 URL 和自动生成的 `API_SECRET`。
-4. 检查 `https://你的服务域名/health` 返回 `{"status":"ok"}`。
+3. 创建 Blueprint，等待 Docker 构建与健康检查完成。
+4. 记录服务 URL 和自动生成的 `API_SECRET`。
+5. 检查 `https://你的服务域名/health` 返回 `{"status":"ok"}`。
 
 ## 配置 Custom GPT Actions
 
