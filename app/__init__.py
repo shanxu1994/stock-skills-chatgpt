@@ -1,0 +1,1 @@
+"""ChatGPT stock skills API."""
