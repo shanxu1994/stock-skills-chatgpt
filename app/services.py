@@ -24,6 +24,41 @@ def _tushare_client():
     return ts.pro_api(token)
 
 
+def _has_tushare_token() -> bool:
+    return bool(os.getenv("TUSHARE_TOKEN", "").strip())
+
+
+def _fallback_reason(exc: Exception | None) -> str:
+    if exc is None:
+        return "TUSHARE_TOKEN is not configured"
+    return f"Tushare unavailable or permission denied: {exc}"
+
+
+def _akshare():
+    import akshare as ak
+
+    return ak
+
+
+def _date_value(value: Any) -> str:
+    return pd.to_datetime(value).strftime("%Y%m%d")
+
+
+def _rename_available(df: pd.DataFrame, columns: dict[str, str]) -> pd.DataFrame:
+    return df.rename(columns={key: value for key, value in columns.items() if key in df.columns})
+
+
+def _fallback_result(items: list[dict[str, Any]], reason: str, **extra: Any) -> dict[str, Any]:
+    return {
+        **extra,
+        "items": items,
+        "source": "akshare",
+        "fallback": True,
+        "fallback_reason": reason,
+        "disclaimer": "Market research only; not investment advice.",
+    }
+
+
 def normalize_symbol(symbol: str) -> tuple[str, str]:
     raw = symbol.strip().upper()
     if raw.startswith("HK") and raw[2:].isdigit():
@@ -160,12 +195,31 @@ def analyze_stocks(symbols: list[str], days: int, include_news: bool) -> dict[st
 
 def sector_rank(trade_date: str | None, top: int) -> dict[str, Any]:
     selected = trade_date or date.today().strftime("%Y%m%d")
-    df = _tushare_client().ths_daily(trade_date=selected, fields="ts_code,name,close,pct_chg,vol,turnover_rate,total_mv")
-    if df is None or df.empty:
-        return {"trade_date": selected, "items": [], "note": "No data; check trading date or Tushare permissions."}
-    df = df[df["ts_code"].astype(str).str.startswith("885")].copy()
-    df = df.sort_values("pct_chg", ascending=False).head(top)
-    return {"trade_date": selected, "items": _records(df), "disclaimer": "Market research only; not investment advice."}
+    tushare_error: Exception | None = None
+    if _has_tushare_token():
+        try:
+            df = _tushare_client().ths_daily(trade_date=selected, fields="ts_code,name,close,pct_chg,vol,turnover_rate,total_mv")
+            if df is not None and not df.empty:
+                df = df[df["ts_code"].astype(str).str.startswith("885")].copy()
+                df = df.sort_values("pct_chg", ascending=False).head(top)
+                return {"trade_date": selected, "items": _records(df), "source": "tushare", "fallback": False, "disclaimer": "Market research only; not investment advice."}
+            tushare_error = RuntimeError("No data returned")
+        except Exception as exc:
+            tushare_error = exc
+
+    reason = _fallback_reason(tushare_error)
+    try:
+        df = _akshare().stock_board_concept_name_em()
+        df = _rename_available(df, {
+            "板块名称": "name", "板块代码": "ts_code", "最新价": "close",
+            "涨跌幅": "pct_chg", "成交量": "vol", "换手率": "turnover_rate",
+            "总市值": "total_mv",
+        })
+        if "pct_chg" in df:
+            df = df.sort_values("pct_chg", ascending=False)
+        return _fallback_result(_records(df.head(top)), reason, trade_date=selected)
+    except Exception as exc:
+        return _fallback_result([], reason, trade_date=selected, note=f"AkShare fallback failed: {exc}")
 
 
 def lhb_rank(trade_date: str | None, top: int, ts_code: str | None) -> dict[str, Any]:
@@ -173,9 +227,36 @@ def lhb_rank(trade_date: str | None, top: int, ts_code: str | None) -> dict[str,
     params: dict[str, Any] = {"trade_date": selected}
     if ts_code:
         params["ts_code"] = ts_code
-    df = _tushare_client().top_list(**params)
-    if df is None or df.empty:
-        return {"trade_date": selected, "items": [], "note": "No data; check trading date or Tushare permissions."}
+    tushare_error: Exception | None = None
+    df: pd.DataFrame | None = None
+    if _has_tushare_token():
+        try:
+            df = _tushare_client().top_list(**params)
+            if df is None or df.empty:
+                tushare_error = RuntimeError("No data returned")
+                df = None
+        except Exception as exc:
+            tushare_error = exc
+    if df is None:
+        reason = _fallback_reason(tushare_error)
+        try:
+            df = _akshare().stock_lhb_detail_em(start_date=selected, end_date=selected)
+            df = _rename_available(df, {
+                "代码": "ts_code", "名称": "name", "上榜日": "trade_date",
+                "涨跌幅": "pct_change", "龙虎榜净买额": "net_amount",
+                "龙虎榜净买额占总成交额比": "net_rate", "收盘价": "close",
+                "成交额": "amount", "换手率": "turnover_rate", "上榜原因": "reason",
+            })
+            if ts_code and "ts_code" in df:
+                code = ts_code.split(".")[0]
+                df = df[df["ts_code"].astype(str).str.zfill(6) == code]
+        except Exception as exc:
+            return _fallback_result([], reason, trade_date=selected, note=f"AkShare fallback failed: {exc}")
+    if df.empty:
+        result = {"trade_date": selected, "note": "No Dragon Tiger List data for this date."}
+        if tushare_error is not None or not _has_tushare_token():
+            return _fallback_result([], _fallback_reason(tushare_error), **result)
+        return {**result, "source": "tushare", "fallback": False}
     names = df["name"].fillna("").astype(str).str.upper()
     df = df[~names.str.startswith(("ST", "*ST", "S*ST", "SST"))].copy()
     for column in ("pct_change", "net_amount", "net_rate"):
@@ -187,18 +268,86 @@ def lhb_rank(trade_date: str | None, top: int, ts_code: str | None) -> dict[str,
         + df["net_rate"].rank(pct=True) * 20
     ).round(2)
     df = df.sort_values("score", ascending=False).head(top)
-    return {"trade_date": selected, "items": _records(df), "disclaimer": "Market research only; not investment advice."}
+    result = {"trade_date": selected, "items": _records(df), "disclaimer": "Market research only; not investment advice."}
+    if tushare_error is not None or not _has_tushare_token():
+        result.update({"source": "akshare", "fallback": True, "fallback_reason": _fallback_reason(tushare_error)})
+    else:
+        result.update({"source": "tushare", "fallback": False})
+    return result
+
+
+def _akshare_query(api_name: str, params: dict[str, Any], limit: int) -> pd.DataFrame | None:
+    ak = _akshare()
+    if api_name == "stock_basic":
+        df = ak.stock_info_a_code_name()
+        return _rename_available(df, {"code": "symbol", "name": "name"})
+    if api_name == "trade_cal":
+        df = ak.tool_trade_date_hist_sina()
+        df = _rename_available(df, {"trade_date": "cal_date"})
+        if "cal_date" in df:
+            df["cal_date"] = df["cal_date"].map(_date_value)
+            start = str(params.get("start_date", ""))
+            end = str(params.get("end_date", ""))
+            if start:
+                df = df[df["cal_date"] >= start]
+            if end:
+                df = df[df["cal_date"] <= end]
+            df["is_open"] = 1
+        return df
+    if api_name in {"daily", "weekly", "monthly"}:
+        code = str(params.get("ts_code", params.get("symbol", ""))).split(".")[0]
+        if not code:
+            return None
+        period = {"daily": "daily", "weekly": "weekly", "monthly": "monthly"}[api_name]
+        df = ak.stock_zh_a_hist(
+            symbol=code,
+            period=period,
+            start_date=str(params.get("start_date", "19700101")),
+            end_date=str(params.get("end_date", date.today().strftime("%Y%m%d"))),
+            adjust="",
+        )
+        df = _rename_available(df, {
+            "日期": "trade_date", "股票代码": "ts_code", "开盘": "open", "收盘": "close",
+            "最高": "high", "最低": "low", "成交量": "vol", "成交额": "amount",
+            "振幅": "amplitude", "涨跌幅": "pct_chg", "涨跌额": "change", "换手率": "turnover_rate",
+        })
+        if "trade_date" in df:
+            df["trade_date"] = df["trade_date"].map(_date_value)
+        if "ts_code" not in df:
+            df["ts_code"] = params.get("ts_code", code)
+        return df
+    if api_name == "ths_index":
+        return _rename_available(ak.stock_board_concept_name_em(), {"板块代码": "ts_code", "板块名称": "name", "涨跌幅": "pct_chg"})
+    if api_name == "top_list":
+        selected = str(params.get("trade_date", date.today().strftime("%Y%m%d")))
+        return _rename_available(ak.stock_lhb_detail_em(start_date=selected, end_date=selected), {"代码": "ts_code", "名称": "name", "上榜日": "trade_date", "涨跌幅": "pct_change", "龙虎榜净买额": "net_amount"})
+    return None
 
 
 def tushare_query(api_name: str, params: dict[str, Any], fields: list[str] | None, limit: int) -> dict[str, Any]:
-    pro = _tushare_client()
-    method = getattr(pro, api_name)
     safe_params = {key: value for key, value in params.items() if value is not None}
-    if fields:
-        safe_params["fields"] = ",".join(fields)
-    df = method(**safe_params)
-    if df is None:
-        rows: list[dict[str, Any]] = []
-    else:
+    tushare_error: Exception | None = None
+    if _has_tushare_token():
+        try:
+            query_params = dict(safe_params)
+            if fields:
+                query_params["fields"] = ",".join(fields)
+            df = getattr(_tushare_client(), api_name)(**query_params)
+            rows = [] if df is None else _records(df.head(limit))
+            return {"api_name": api_name, "params": query_params, "count": len(rows), "truncated": bool(df is not None and len(df) > limit), "items": rows, "source": "tushare", "fallback": False}
+        except Exception as exc:
+            tushare_error = exc
+
+    reason = _fallback_reason(tushare_error)
+    try:
+        df = _akshare_query(api_name, safe_params, limit)
+        if df is None:
+            return _fallback_result([], reason, api_name=api_name, params=safe_params, count=0, truncated=False, note=f"The public fallback does not currently support {api_name}.")
+        if fields:
+            available = [field for field in fields if field in df.columns]
+            if available:
+                df = df[available]
         rows = _records(df.head(limit))
-    return {"api_name": api_name, "params": safe_params, "count": len(rows), "truncated": bool(df is not None and len(df) > limit), "items": rows}
+        return _fallback_result(rows, reason, api_name=api_name, params=safe_params, count=len(rows), truncated=len(df) > limit)
+    except Exception as exc:
+        return _fallback_result([], reason, api_name=api_name, params=safe_params, count=0, truncated=False, note=f"AkShare fallback failed: {exc}")

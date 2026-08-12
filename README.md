@@ -5,7 +5,7 @@
 ## 功能
 
 - A股、港股、美股行情与 MA/MACD/RSI/量能/乖离率机械评分
-- Tushare 财务、估值、资金流、公告、板块、指数、基金与宏观查询
+- Tushare 财务、估值、资金流、公告、板块、指数、基金与宏观查询；无 Token 或权限不足时自动降级到 AkShare
 - A股概念板块排行
 - 龙虎榜排行并过滤 ST 类股票
 - 可选 Tavily 新闻搜索
@@ -19,6 +19,7 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
+# 可选；未设置时公开数据查询会自动使用 AkShare
 export TUSHARE_TOKEN="your-token"
 export API_SECRET="your-long-random-secret"
 uvicorn app.main:app --reload
@@ -31,7 +32,7 @@ uvicorn app.main:app --reload
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/shanxu1994/stock-skills-chatgpt)
 
 1. 点击上方按钮并使用 GitHub 登录 Render。
-2. 设置 Secret：`TUSHARE_TOKEN`；可选设置 `TAVILY_API_KEY`。
+2. 可选设置 Secret：`TUSHARE_TOKEN`、`TAVILY_API_KEY`。不设置 Tushare Token 也可使用公开数据降级功能。
 3. 创建 Blueprint，等待 Docker 构建与健康检查完成。
 4. 记录服务 URL 和自动生成的 `API_SECRET`。
 5. 检查 `https://你的服务域名/health` 返回 `{"status":"ok"}`。
@@ -58,6 +59,12 @@ uvicorn app.main:app --reload
 - `POST /v1/tushare/query`
 
 完整 schema 由 FastAPI 自动生成在 `/openapi.json`。
+
+## 数据源与自动降级
+
+服务在配置了 `TUSHARE_TOKEN` 时始终优先使用 Tushare。Token 未配置、无接口权限、额度不足或 Tushare 请求异常时，`rankConceptSectors`、`rankDragonTigerList` 和 `queryTushare` 会自动改用无需 Token 的 AkShare 公开数据源，而不是直接返回 5xx。
+
+降级响应尽量沿用原字段，并额外包含 `source: "akshare"`、`fallback: true` 和 `fallback_reason`。通用查询目前可降级的类型包括 `stock_basic`、`trade_cal`、`daily`、`weekly`、`monthly`、`ths_index` 和 `top_list`；其他 Tushare 专属数据若没有可靠的公开映射，会返回空 `items` 和说明性的 `note`，不会令整个 Action 失败。公开源的更新时间、字段和历史覆盖范围可能与 Tushare 不同。
 
 ## 安全说明
 
