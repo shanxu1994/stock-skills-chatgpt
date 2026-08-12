@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -57,6 +58,30 @@ def _fallback_result(items: list[dict[str, Any]], reason: str, **extra: Any) -> 
         "fallback_reason": reason,
         "disclaimer": "Market research only; not investment advice.",
     }
+
+
+def _akshare_concept_boards() -> pd.DataFrame:
+    """Load concept boards with a small retry and a second public AkShare endpoint."""
+    ak = _akshare()
+    errors: list[str] = []
+    loaders = [
+        getattr(ak, "stock_board_concept_name_em", None),
+        getattr(ak, "stock_board_concept_name_ths", None),
+    ]
+    for loader in loaders:
+        if loader is None:
+            continue
+        for attempt in range(2):
+            try:
+                frame = loader()
+                if frame is not None and not frame.empty:
+                    return frame
+                errors.append("empty response")
+            except Exception as exc:
+                errors.append(str(exc))
+                if attempt == 0:
+                    time.sleep(0.4)
+    raise RuntimeError("; ".join(errors[-3:]) or "no public concept-board endpoint available")
 
 
 def normalize_symbol(symbol: str) -> tuple[str, str]:
@@ -209,7 +234,7 @@ def sector_rank(trade_date: str | None, top: int) -> dict[str, Any]:
 
     reason = _fallback_reason(tushare_error)
     try:
-        df = _akshare().stock_board_concept_name_em()
+        df = _akshare_concept_boards()
         df = _rename_available(df, {
             "板块名称": "name", "板块代码": "ts_code", "最新价": "close",
             "涨跌幅": "pct_chg", "成交量": "vol", "换手率": "turnover_rate",
@@ -317,7 +342,7 @@ def _akshare_query(api_name: str, params: dict[str, Any], limit: int) -> pd.Data
             df["ts_code"] = params.get("ts_code", code)
         return df
     if api_name == "ths_index":
-        return _rename_available(ak.stock_board_concept_name_em(), {"板块代码": "ts_code", "板块名称": "name", "涨跌幅": "pct_chg"})
+        return _rename_available(_akshare_concept_boards(), {"板块代码": "ts_code", "板块名称": "name", "涨跌幅": "pct_chg"})
     if api_name == "top_list":
         selected = str(params.get("trade_date", date.today().strftime("%Y%m%d")))
         return _rename_available(ak.stock_lhb_detail_em(start_date=selected, end_date=selected), {"代码": "ts_code", "名称": "name", "上榜日": "trade_date", "涨跌幅": "pct_change", "龙虎榜净买额": "net_amount"})
