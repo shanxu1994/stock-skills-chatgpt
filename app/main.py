@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from .auth import require_api_key
 from .models import LhbRequest, MarketRequest, StockAnalyzeRequest, TushareQueryRequest
 from .services import analyze_stocks, lhb_rank, sector_rank, tushare_query
+from datetime import date
 
 
 class HealthResponse(BaseModel):
@@ -29,6 +30,29 @@ app.add_middleware(
 @app.get("/health", operation_id="healthCheck", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+@app.get("/diagnostics/public-data", operation_id="diagnosePublicData", dependencies=[Depends(require_api_key)])
+def diagnose_public_data():
+    """Temporary deployment diagnostic; reports counts/sources, never tokens or raw credentials."""
+    result = {"trade_date": date.today().strftime("%Y%m%d"), "checks": {}}
+    try:
+        sectors = sector_rank(result["trade_date"], 5)
+        result["checks"]["concept_sectors"] = {
+            "source": sectors.get("source"), "count": len(sectors.get("items", [])),
+            "fallback": sectors.get("fallback"), "error": sectors.get("note"),
+        }
+    except Exception as exc:
+        result["checks"]["concept_sectors"] = {"source": None, "count": 0, "error": str(exc)}
+    try:
+        basics = tushare_query("stock_basic", {"ts_code": "600519.SH"}, ["symbol", "name"], 1)
+        result["checks"]["stock_basic"] = {
+            "source": basics.get("source"), "count": basics.get("count", 0),
+            "cached": basics.get("cached", False), "error": basics.get("note"),
+        }
+    except Exception as exc:
+        result["checks"]["stock_basic"] = {"source": None, "count": 0, "error": str(exc)}
+    return result
 
 
 def call(service, *args):

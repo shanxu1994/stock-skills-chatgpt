@@ -14,6 +14,15 @@ def test_health():
     assert response.json() == {"status": "ok"}
 
 
+def test_public_data_diagnostic_reports_counts(monkeypatch):
+    monkeypatch.setattr("app.main.sector_rank", lambda *_: {"source": "akshare", "fallback": True, "items": [{"name": "机器人"}]})
+    monkeypatch.setattr("app.main.tushare_query", lambda *_: {"source": "public_http", "count": 1, "cached": False, "items": [{"name": "贵州茅台"}]})
+    response = client.get("/diagnostics/public-data")
+    assert response.status_code == 200
+    assert response.json()["checks"]["concept_sectors"]["count"] == 1
+    assert response.json()["checks"]["stock_basic"]["count"] == 1
+
+
 def test_analyze_validates_empty_symbols():
     response = client.post("/v1/stocks/analyze", json={"symbols": []})
     assert response.status_code == 422
@@ -87,3 +96,28 @@ def test_query_concept_index_fallback_returns_items(monkeypatch):
     assert result["source"] == "akshare"
     assert result["count"] == 1
     assert result["items"][0]["name"] == "机器人"
+
+
+def test_query_stock_basic_uses_public_name_fallback(monkeypatch):
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    monkeypatch.setattr(services, "_public_stock_name", lambda _: __import__("pandas").DataFrame([{"symbol": "600519", "name": "贵州茅台"}]))
+    monkeypatch.setattr(services, "_akshare", lambda: object())
+    result = services.tushare_query("stock_basic", {"ts_code": "600519.SH"}, None, 5)
+    assert result["count"] == 1
+    assert result["items"][0]["name"] == "贵州茅台"
+
+
+def test_query_cache_returns_cached_result(monkeypatch):
+    monkeypatch.setenv("TUSHARE_TOKEN", "configured")
+    calls = {"count": 0}
+    class Pro:
+        def stock_basic(self, **_):
+            calls["count"] += 1
+            return __import__("pandas").DataFrame([{"ts_code": "600519.SH", "name": "贵州茅台"}])
+    monkeypatch.setattr(services, "_tushare_client", lambda: Pro())
+    services._QUERY_CACHE.clear()
+    first = services.tushare_query("stock_basic", {"ts_code": "600519.SH"}, None, 5)
+    second = services.tushare_query("stock_basic", {"ts_code": "600519.SH"}, None, 5)
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert calls["count"] == 1

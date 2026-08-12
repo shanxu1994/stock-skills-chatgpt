@@ -9,6 +9,10 @@ import numpy as np
 import pandas as pd
 
 
+_QUERY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_QUERY_CACHE_TTL = 300
+
+
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
     if df is None or df.empty:
         return []
@@ -60,6 +64,54 @@ def _fallback_result(items: list[dict[str, Any]], reason: str, **extra: Any) -> 
     }
 
 
+def _cache_key(api_name: str, params: dict[str, Any], fields: list[str] | None, limit: int) -> str:
+    return repr((api_name, sorted(params.items()), tuple(fields or ()), limit))
+
+
+def _cached_query(key: str) -> dict[str, Any] | None:
+    item = _QUERY_CACHE.get(key)
+    if item and time.monotonic() - item[0] < _QUERY_CACHE_TTL:
+        return item[1]
+    if item:
+        _QUERY_CACHE.pop(key, None)
+    return None
+
+
+def _save_query_cache(key: str, result: dict[str, Any]) -> dict[str, Any]:
+    _QUERY_CACHE[key] = (time.monotonic(), result)
+    return result
+
+
+def _public_stock_name(ts_code: str) -> pd.DataFrame | None:
+    """Fetch one A-share name from Tencent's public quote endpoint."""
+    import httpx
+
+    code = str(ts_code).split(".")[0].zfill(6)
+    market = "sh" if code.startswith(("5", "6", "9")) else "sz"
+    response = httpx.get(f"https://qt.gtimg.cn/q={market}{code}", timeout=8)
+    response.raise_for_status()
+    text = response.content.decode("gbk", errors="ignore")
+    fields = text.split("~")
+    if len(fields) > 2 and fields[1].strip():
+        return pd.DataFrame([{"symbol": code, "name": fields[1].strip()}])
+    return None
+
+
+def _public_concept_boards() -> pd.DataFrame | None:
+    """Fetch concept boards directly from Eastmoney's public JSON endpoint."""
+    import httpx
+
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {"pn": 1, "pz": 100, "po": 1, "np": 1, "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": 2, "invt": 2, "fid": "f3", "fs": "m:90 t:3 f:!50", "fields": "f2,f3,f12,f14,f104,f105,f136"}
+    response = httpx.get(url, params=params, timeout=12)
+    response.raise_for_status()
+    data = response.json().get("data") or {}
+    rows = data.get("diff") or []
+    if not rows:
+        return None
+    return pd.DataFrame(rows).rename(columns={"f12": "ts_code", "f14": "name", "f2": "close", "f3": "pct_chg", "f104": "up_count", "f105": "down_count", "f136": "leading_stock"})
+
+
 def _akshare_concept_boards() -> pd.DataFrame:
     """Load concept boards with a small retry and a second public AkShare endpoint."""
     ak = _akshare()
@@ -81,6 +133,9 @@ def _akshare_concept_boards() -> pd.DataFrame:
                 errors.append(str(exc))
                 if attempt == 0:
                     time.sleep(0.4)
+    public = _public_concept_boards()
+    if public is not None and not public.empty:
+        return public
     raise RuntimeError("; ".join(errors[-3:]) or "no public concept-board endpoint available")
 
 
@@ -304,6 +359,14 @@ def lhb_rank(trade_date: str | None, top: int, ts_code: str | None) -> dict[str,
 def _akshare_query(api_name: str, params: dict[str, Any], limit: int) -> pd.DataFrame | None:
     ak = _akshare()
     if api_name == "stock_basic":
+        code = params.get("ts_code") or params.get("symbol")
+        if code:
+            try:
+                df = _public_stock_name(str(code))
+                if df is not None and not df.empty:
+                    return df
+            except Exception:
+                pass
         df = ak.stock_info_a_code_name()
         return _rename_available(df, {"code": "symbol", "name": "name"})
     if api_name == "trade_cal":
@@ -351,6 +414,10 @@ def _akshare_query(api_name: str, params: dict[str, Any], limit: int) -> pd.Data
 
 def tushare_query(api_name: str, params: dict[str, Any], fields: list[str] | None, limit: int) -> dict[str, Any]:
     safe_params = {key: value for key, value in params.items() if value is not None}
+    cache_key = _cache_key(api_name, safe_params, fields, limit)
+    cached = _cached_query(cache_key)
+    if cached is not None:
+        return {**cached, "cached": True}
     tushare_error: Exception | None = None
     if _has_tushare_token():
         try:
@@ -359,7 +426,7 @@ def tushare_query(api_name: str, params: dict[str, Any], fields: list[str] | Non
                 query_params["fields"] = ",".join(fields)
             df = getattr(_tushare_client(), api_name)(**query_params)
             rows = [] if df is None else _records(df.head(limit))
-            return {"api_name": api_name, "params": query_params, "count": len(rows), "truncated": bool(df is not None and len(df) > limit), "items": rows, "source": "tushare", "fallback": False}
+            return _save_query_cache(cache_key, {"api_name": api_name, "params": query_params, "count": len(rows), "truncated": bool(df is not None and len(df) > limit), "items": rows, "source": "tushare", "fallback": False, "cached": False})
         except Exception as exc:
             tushare_error = exc
 
@@ -373,6 +440,6 @@ def tushare_query(api_name: str, params: dict[str, Any], fields: list[str] | Non
             if available:
                 df = df[available]
         rows = _records(df.head(limit))
-        return _fallback_result(rows, reason, api_name=api_name, params=safe_params, count=len(rows), truncated=len(df) > limit)
+        return _save_query_cache(cache_key, _fallback_result(rows, reason, api_name=api_name, params=safe_params, count=len(rows), truncated=len(df) > limit, cached=False))
     except Exception as exc:
         return _fallback_result([], reason, api_name=api_name, params=safe_params, count=0, truncated=False, note=f"AkShare fallback failed: {exc}")
