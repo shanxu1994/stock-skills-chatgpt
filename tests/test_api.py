@@ -60,3 +60,30 @@ def test_unsupported_fallback_is_structured(monkeypatch):
     assert result["items"] == []
     assert result["fallback"] is True
     assert "does not currently support" in result["note"]
+
+
+def test_lhb_falls_back_without_tushare_token(monkeypatch):
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    frame = __import__("pandas").DataFrame([{
+        "代码": "600519", "名称": "贵州茅台", "涨跌幅": 2.1,
+        "龙虎榜净买额": 1200000, "龙虎榜净买额占总成交额比": 3.4,
+    }])
+    monkeypatch.setattr(services, "_akshare", lambda: type("AK", (), {
+        "stock_lhb_detail_em": staticmethod(lambda **_: frame),
+    })())
+    result = services.lhb_rank("20260812", 5, None)
+    assert result["source"] == "akshare"
+    assert result["fallback"] is True
+    assert result["items"][0]["name"] == "贵州茅台"
+
+
+def test_query_concept_index_fallback_returns_items(monkeypatch):
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    frame = __import__("pandas").DataFrame([{"板块代码": "BK1", "板块名称": "机器人", "涨跌幅": 3.2}])
+    monkeypatch.setattr(services, "_akshare", lambda: type("AK", (), {
+        "stock_board_concept_name_em": staticmethod(lambda: frame),
+    })())
+    result = services.tushare_query("ths_index", {}, None, 5)
+    assert result["source"] == "akshare"
+    assert result["count"] == 1
+    assert result["items"][0]["name"] == "机器人"
