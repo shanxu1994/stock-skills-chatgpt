@@ -62,9 +62,9 @@ uvicorn app.main:app --reload
 
 ## 数据源与自动降级
 
-服务在配置了 `TUSHARE_TOKEN` 时始终优先使用 Tushare。Token 未配置、无接口权限、额度不足或 Tushare 请求异常时，`rankConceptSectors`、`rankDragonTigerList` 和 `queryTushare` 会自动改用无需 Token 的 AkShare 公开数据源，而不是直接返回 5xx。
+服务优先使用免费的公开 HTTP 数据源：概念板块使用东方财富公开行情接口，指定股票基础信息使用腾讯公开行情接口。公开接口暂时不可用时，再尝试 AkShare；配置了 `TUSHARE_TOKEN` 后，其他 Tushare 查询仍会优先使用 Tushare，遇到无权限、额度不足或限流时自动降级。
 
-降级响应尽量沿用原字段，并额外包含 `source: "akshare"`、`fallback: true` 和 `fallback_reason`。通用查询目前可降级的类型包括 `stock_basic`、`trade_cal`、`daily`、`weekly`、`monthly`、`ths_index` 和 `top_list`；其他 Tushare 专属数据若没有可靠的公开映射，会返回空 `items` 和说明性的 `note`，不会令整个 Action 失败。公开源的更新时间、字段和历史覆盖范围可能与 Tushare 不同。
+降级响应尽量沿用原字段，并额外包含 `source`、`fallback: true` 和 `fallback_reason`。`stock_basic` 查询结果会缓存 5 分钟，减少重复请求触发限流。通用查询目前可降级的类型包括 `stock_basic`、`trade_cal`、`daily`、`weekly`、`monthly`、`ths_index` 和 `top_list`；其他 Tushare 专属数据若没有可靠的公开映射，会返回空 `items` 和说明性的 `note`，不会令整个 Action 失败。公开源的更新时间、字段和历史覆盖范围可能与 Tushare 不同。
 
 ## 安全说明
 

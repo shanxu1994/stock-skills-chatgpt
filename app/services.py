@@ -53,11 +53,11 @@ def _rename_available(df: pd.DataFrame, columns: dict[str, str]) -> pd.DataFrame
     return df.rename(columns={key: value for key, value in columns.items() if key in df.columns})
 
 
-def _fallback_result(items: list[dict[str, Any]], reason: str, **extra: Any) -> dict[str, Any]:
+def _fallback_result(items: list[dict[str, Any]], reason: str, *, source: str = "akshare", **extra: Any) -> dict[str, Any]:
     return {
         **extra,
         "items": items,
-        "source": "akshare",
+        "source": source,
         "fallback": True,
         "fallback_reason": reason,
         "disclaimer": "Market research only; not investment advice.",
@@ -275,6 +275,14 @@ def analyze_stocks(symbols: list[str], days: int, include_news: bool) -> dict[st
 
 def sector_rank(trade_date: str | None, top: int) -> dict[str, Any]:
     selected = trade_date or date.today().strftime("%Y%m%d")
+    # Prefer the free public board endpoint: it is not subject to Tushare points or rate limits.
+    try:
+        public = _public_concept_boards()
+        if public is not None and not public.empty:
+            public = public.sort_values("pct_chg", ascending=False).head(top)
+            return _fallback_result(_records(public), "Free public market data", source="public_http", trade_date=selected)
+    except Exception:
+        pass
     tushare_error: Exception | None = None
     if _has_tushare_token():
         try:
@@ -418,6 +426,18 @@ def tushare_query(api_name: str, params: dict[str, Any], fields: list[str] | Non
     cached = _cached_query(cache_key)
     if cached is not None:
         return {**cached, "cached": True}
+    if api_name == "stock_basic":
+        try:
+            public = _public_stock_name(str(safe_params.get("ts_code") or safe_params.get("symbol") or "600519"))
+            if public is not None and not public.empty:
+                if fields:
+                    available = [field for field in fields if field in public.columns]
+                    if available:
+                        public = public[available]
+                rows = _records(public.head(limit))
+                return _save_query_cache(cache_key, _fallback_result(rows, "Free public market data", source="public_http", api_name=api_name, params=safe_params, count=len(rows), truncated=False, cached=False))
+        except Exception:
+            pass
     tushare_error: Exception | None = None
     if _has_tushare_token():
         try:
