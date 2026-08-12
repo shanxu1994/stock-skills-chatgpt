@@ -1,14 +1,21 @@
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from .auth import require_api_key
 from .models import LhbRequest, MarketRequest, StockAnalyzeRequest, TushareQueryRequest
 from .services import analyze_stocks, lhb_rank, sector_rank, tushare_query
 
+
+class HealthResponse(BaseModel):
+    status: str
+
+
 app = FastAPI(
     title="China & Global Stock Research Skills API",
     description="Cloud API for stock analysis, Tushare research, A-share sectors and Dragon Tiger List. Research only; not investment advice.",
     version="1.0.0",
+    servers=[{"url": "https://stock-skills-chatgpt-p4vq.onrender.com"}],
 )
 
 app.add_middleware(
@@ -19,9 +26,9 @@ app.add_middleware(
 )
 
 
-@app.get("/health", operation_id="healthCheck")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+@app.get("/health", operation_id="healthCheck", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return HealthResponse(status="ok")
 
 
 def call(service, *args):
