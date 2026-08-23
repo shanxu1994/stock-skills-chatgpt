@@ -4,8 +4,9 @@ from pydantic import BaseModel
 
 from .auth import require_api_key
 from .models import LhbRequest, MarketRequest, StockAnalyzeRequest, TushareQueryRequest
+from . import services as stock_services
 from .services import analyze_stocks, lhb_rank, sector_rank, tushare_query
-from datetime import date
+from datetime import date, datetime, timedelta
 
 
 class HealthResponse(BaseModel):
@@ -64,9 +65,80 @@ def call(service, *args):
         raise HTTPException(status_code=502, detail=f"Upstream data request failed: {exc}") from exc
 
 
+def analyze_stocks_without_basic_limit(symbols: list[str], days: int, include_news: bool):
+    """Analyze A-shares without calling Tushare stock_basic.
+
+    Tushare stock_basic can have a very low per-hour quota on some accounts.  The
+    stock name is optional for technical analysis, so A-share names are fetched
+    from Tencent's public quote endpoint on a best-effort basis.  A failure to
+    fetch the name never blocks price/indicator analysis.
+    """
+    results = []
+    passthrough = []
+
+    for requested in symbols:
+        market, normalized = stock_services.normalize_symbol(requested)
+        if market != "a":
+            passthrough.append(requested)
+            continue
+
+        try:
+            pro = stock_services._tushare_client()
+            end = date.today()
+            start = end - timedelta(days=max(days * 2, 120))
+            frame = pro.daily(
+                ts_code=normalized,
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+            )
+            if frame is None or frame.empty:
+                raise RuntimeError("No market data returned")
+
+            frame = frame.sort_values("trade_date").tail(days).rename(columns={"vol": "volume"})
+            frame = frame[["trade_date", "open", "high", "low", "close", "volume"]]
+
+            name = None
+            try:
+                name_df = stock_services._public_stock_name(normalized)
+                if name_df is not None and not name_df.empty:
+                    name = str(name_df.iloc[0]["name"])
+            except Exception:
+                # Name lookup is non-critical; never fail technical analysis for it.
+                pass
+
+            results.append({
+                "requested_symbol": requested,
+                "symbol": normalized,
+                "market": market,
+                "name": name,
+                "as_of": str(frame.iloc[-1]["trade_date"]),
+                "indicators": stock_services._indicators(frame),
+                "news": stock_services._news(name or normalized) if include_news else [],
+                "data_points": len(frame),
+                "error": None,
+            })
+        except Exception as exc:
+            results.append({
+                "requested_symbol": requested,
+                "symbol": normalized,
+                "market": market,
+                "error": str(exc),
+            })
+
+    if passthrough:
+        other = analyze_stocks(passthrough, days, include_news)
+        results.extend(other.get("results", []))
+
+    return {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "results": results,
+        "disclaimer": "Market research only; not investment advice.",
+    }
+
+
 @app.post("/v1/stocks/analyze", operation_id="analyzeStocks", dependencies=[Depends(require_api_key)])
 def stocks_analyze(request: StockAnalyzeRequest):
-    return call(analyze_stocks, request.symbols, request.days, request.include_news)
+    return call(analyze_stocks_without_basic_limit, request.symbols, request.days, request.include_news)
 
 
 @app.post("/v1/market/sectors", operation_id="rankConceptSectors", dependencies=[Depends(require_api_key)])
