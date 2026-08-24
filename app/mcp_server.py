@@ -6,19 +6,26 @@ pipeline and fallback behavior.
 """
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .main import intraday_snapshot
 
+
+_RENDER_HOST = "stock-skills-chatgpt-p4vq.onrender.com"
 
 mcp = FastMCP(
     "Stock Skills Intraday",
     stateless_http=True,
     json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[_RENDER_HOST, f"{_RENDER_HOST}:*"],
+        allowed_origins=["https://chatgpt.com", "https://chat.openai.com"],
+    ),
 )
 # This MCP app is mounted by FastAPI at /mcp. FastMCP defaults its internal
 # Streamable HTTP route to /mcp too, which would produce /mcp/mcp. Setting the
-# internal path to / makes the public endpoint exactly /mcp while remaining
-# compatible with the pinned MCP 1.x dependency range.
+# internal path to / makes the public endpoint exactly /mcp.
 mcp.settings.streamable_http_path = "/"
 
 
