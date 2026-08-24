@@ -34,5 +34,7 @@ def analyze_intraday(symbol: str, bars: int = 240) -> dict:
     return intraday_snapshot(symbol, bars)
 
 
-# Streamable HTTP ASGI application. Mount this from the main FastAPI app.
-mcp_app = mcp.streamable_http_app()
+# The host FastAPI app mounts this sub-app at /mcp. The MCP SDK's default
+# internal path is also /mcp, which would otherwise expose /mcp/mcp. Setting
+# the internal transport path to / keeps the public endpoint exactly /mcp.
+mcp_app = mcp.streamable_http_app(streamable_http_path="/")
