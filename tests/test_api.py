@@ -2,7 +2,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app, _fetch_tencent_1m, intraday_snapshot
 from app import services
-from app.dashboard import build_dashboard_payload, build_strict_signals
+from app.dashboard import build_dashboard_payload, build_strict_signals, dashboard_symbols
 from app.services import normalize_symbol
 
 
@@ -35,9 +35,23 @@ def test_dashboard_payload_contains_fixed_stocks_and_signals():
             },
         }
     payload = build_dashboard_payload(loader)
-    assert [item["name"] for item in payload["stocks"]] == ["德明利", "诺德股份"]
+    assert [item["name"] for item in payload["stocks"]] == ["德明利", "诺德股份", "翰宇药业"]
     assert all(item["signals"]["t_system"]["buy_zone"] for item in payload["stocks"])
     assert all(item["signals"]["trend_system"]["breakout_confirmation"] for item in payload["stocks"])
+
+
+def test_dashboard_symbols_supports_custom_a_shares():
+    assert dashboard_symbols("600519, SZ002594,300199.SZ") == [
+        {"symbol": "600519", "name": "600519"},
+        {"symbol": "002594", "name": "002594"},
+        {"symbol": "300199", "name": "翰宇药业"},
+    ]
+
+
+def test_dashboard_data_rejects_invalid_symbols():
+    assert client.get("/dashboard/data?symbols=TSLA").status_code == 422
+    too_many = ",".join(f"{i:06d}" for i in range(11))
+    assert client.get(f"/dashboard/data?symbols={too_many}").status_code == 422
 
 
 def test_strict_signals_do_not_use_fixed_price_levels():

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import re
 from typing import Any, Callable
 
 
 DASHBOARD_STOCKS = (
     {"symbol": "001309", "name": "德明利"},
     {"symbol": "600110", "name": "诺德股份"},
+    {"symbol": "300199", "name": "翰宇药业"},
 )
+MAX_DASHBOARD_STOCKS = 10
 
 
 def _price(value: float) -> float:
@@ -82,7 +85,31 @@ def build_strict_signals(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_dashboard_payload(loader: Callable[[str, int], dict[str, Any]]) -> dict[str, Any]:
+def dashboard_symbols(raw_symbols: str | None) -> list[dict[str, str]]:
+    if not raw_symbols:
+        return [dict(item) for item in DASHBOARD_STOCKS]
+    symbols = []
+    for raw in raw_symbols.split(","):
+        symbol = raw.strip().upper().removeprefix("SH").removeprefix("SZ")
+        symbol = symbol.removesuffix(".SH").removesuffix(".SZ")
+        if not re.fullmatch(r"\d{6}", symbol):
+            raise ValueError("股票代码必须是6位A股代码")
+        if symbol not in symbols:
+            symbols.append(symbol)
+    if not symbols:
+        raise ValueError("请至少输入一只股票")
+    if len(symbols) > MAX_DASHBOARD_STOCKS:
+        raise ValueError(f"最多同时分析{MAX_DASHBOARD_STOCKS}只股票")
+    defaults = {item["symbol"]: item["name"] for item in DASHBOARD_STOCKS}
+    return [{"symbol": symbol, "name": defaults.get(symbol, symbol)} for symbol in symbols]
+
+
+def build_dashboard_payload(
+    loader: Callable[[str, int], dict[str, Any]],
+    configured_stocks: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    selected = configured_stocks or [dict(item) for item in DASHBOARD_STOCKS]
+
     def load_one(configured: dict[str, str]) -> dict[str, Any]:
         try:
             snapshot = loader(configured["symbol"], 240)
@@ -96,10 +123,10 @@ def build_dashboard_payload(loader: Callable[[str, int], dict[str, Any]]) -> dic
                 "signals": None,
             }
 
-    # Both stocks are independent. Loading concurrently prevents their public
+    # Stocks are independent. Loading concurrently prevents their public
     # provider fallback times from adding up on a Render request.
-    with ThreadPoolExecutor(max_workers=len(DASHBOARD_STOCKS)) as pool:
-        stocks = list(pool.map(load_one, DASHBOARD_STOCKS))
+    with ThreadPoolExecutor(max_workers=min(5, len(selected))) as pool:
+        stocks = list(pool.map(load_one, selected))
     return {
         "generated_at": datetime.now().astimezone().isoformat(),
         "stocks": stocks,
