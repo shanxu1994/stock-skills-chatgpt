@@ -15,6 +15,11 @@ mcp = FastMCP(
     stateless_http=True,
     json_response=True,
 )
+# This MCP app is mounted by FastAPI at /mcp. FastMCP defaults its internal
+# Streamable HTTP route to /mcp too, which would produce /mcp/mcp. Setting the
+# internal path to / makes the public endpoint exactly /mcp while remaining
+# compatible with the pinned MCP 1.x dependency range.
+mcp.settings.streamable_http_path = "/"
 
 
 @mcp.tool()
@@ -34,7 +39,4 @@ def analyze_intraday(symbol: str, bars: int = 240) -> dict:
     return intraday_snapshot(symbol, bars)
 
 
-# The host FastAPI app mounts this sub-app at /mcp. The MCP SDK's default
-# internal path is also /mcp, which would otherwise expose /mcp/mcp. Setting
-# the internal transport path to / keeps the public endpoint exactly /mcp.
-mcp_app = mcp.streamable_http_app(streamable_http_path="/")
+mcp_app = mcp.streamable_http_app()
