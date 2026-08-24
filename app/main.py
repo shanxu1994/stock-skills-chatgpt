@@ -7,9 +7,15 @@ from .models import LhbRequest, MarketRequest, StockAnalyzeRequest, TushareQuery
 from . import services as stock_services
 from .services import analyze_stocks, lhb_rank, sector_rank, tushare_query
 from datetime import date, datetime, timedelta
+import json
+import logging
+import re
 
 import httpx
 import pandas as pd
+
+
+logger = logging.getLogger(__name__)
 
 
 class HealthResponse(BaseModel):
@@ -142,6 +148,107 @@ def _eastmoney_secid(normalized: str) -> str:
     return f"1.{code}" if normalized.endswith(".SH") else f"0.{code}"
 
 
+def _public_symbol(normalized: str) -> str:
+    code = normalized.split(".")[0]
+    return ("sh" if normalized.endswith(".SH") else "sz") + code
+
+
+def _public_get(url: str, *, params: dict | None = None, referer: str) -> httpx.Response:
+    """Use browser-like headers and bounded timeouts for public quote hosts."""
+    response = httpx.get(
+        url,
+        params=params,
+        timeout=httpx.Timeout(12.0, connect=6.0),
+        follow_redirects=True,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+            "Referer": referer,
+            "Connection": "close",
+        },
+    )
+    response.raise_for_status()
+    return response
+
+
+def _fetch_tencent_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | None]:
+    """Fetch the current A-share session from Tencent's independent quote API."""
+    symbol = _public_symbol(normalized)
+    response = _public_get(
+        "https://web.ifzq.gtimg.cn/appstock/app/minute/query",
+        params={"code": symbol},
+        referer="https://gu.qq.com/",
+    )
+    payload = response.json()
+    node = (payload.get("data") or {}).get(symbol) or {}
+    minute_node = node.get("data") or {}
+    rows = minute_node.get("data") or []
+    trade_date = str(minute_node.get("date") or date.today().strftime("%Y%m%d"))
+    if not rows:
+        raise RuntimeError(f"Tencent returned no minute bars (code={payload.get('code')!r})")
+
+    parsed = []
+    for row in rows:
+        parts = str(row).split()
+        if len(parts) < 3:
+            continue
+        hhmm, close, volume = parts[:3]
+        amount = parts[3] if len(parts) > 3 else float(close) * float(volume)
+        parsed.append({
+            "time": f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]} {hhmm[:2]}:{hhmm[2:4]}",
+            "open": float(close), "close": float(close),
+            "high": float(close), "low": float(close),
+            "volume": float(volume), "amount": float(amount),
+        })
+    frame = pd.DataFrame(parsed)
+    if frame.empty:
+        raise RuntimeError("Tencent minute data could not be parsed")
+    # Tencent exposes one price per minute. Derive OHLC from adjacent minute
+    # prices without inventing a session-wide range.
+    frame["open"] = frame["close"].shift(1).fillna(frame["close"])
+    frame["high"] = frame[["open", "close"]].max(axis=1)
+    frame["low"] = frame[["open", "close"]].min(axis=1)
+    qt = node.get("qt") or {}
+    quote = qt.get(symbol) or []
+    name = str(quote[1]) if len(quote) > 1 and quote[1] else None
+    return frame.tail(bars).copy(), name
+
+
+def _fetch_sina_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | None]:
+    """Fetch minute K-lines from Sina's public mobile-finance endpoint."""
+    symbol = _public_symbol(normalized)
+    response = _public_get(
+        "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_data=/CN_MarketDataService.getKLineData",
+        params={"symbol": symbol, "scale": 1, "ma": "no", "datalen": bars},
+        referer="https://finance.sina.com.cn/",
+    )
+    match = re.search(r"=\s*\(?\s*(\[.*\])\s*\)?\s*;?\s*$", response.text, flags=re.S)
+    if not match:
+        raise RuntimeError("Sina returned an unexpected JSONP response")
+    rows = json.loads(match.group(1))
+    parsed = []
+    for row in rows:
+        try:
+            open_price = float(row["open"])
+            close = float(row["close"])
+            high = float(row["high"])
+            low = float(row["low"])
+            volume = float(row.get("volume") or 0)
+            parsed.append({
+                "time": row.get("day") or row.get("time"),
+                "open": open_price, "close": close, "high": high, "low": low,
+                "volume": volume,
+                "amount": volume * (open_price + close + high + low) / 4,
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    frame = pd.DataFrame(parsed)
+    if frame.empty:
+        raise RuntimeError("Sina returned no parseable minute bars")
+    return frame.tail(bars).copy(), None
+
+
 def _fetch_eastmoney_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | None]:
     """Fetch minute bars directly from Eastmoney's public HTTP endpoint."""
     secid = _eastmoney_secid(normalized)
@@ -156,8 +263,7 @@ def _fetch_eastmoney_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str |
         "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
     }
-    response = httpx.get(url, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-    response.raise_for_status()
+    response = _public_get(url, params=params, referer="https://quote.eastmoney.com/")
     payload = response.json().get("data") or {}
     rows = payload.get("klines") or []
     if not rows:
@@ -290,16 +396,34 @@ def intraday_snapshot(symbol: str, bars: int):
     if market != "a":
         raise RuntimeError("Intraday public minute endpoint currently supports A-shares only")
 
-    source = "eastmoney_public_http"
-    fallback = False
-    fallback_reason = None
-    try:
-        frame, name = _fetch_eastmoney_1m(normalized, bars)
-    except Exception as first_exc:
-        source = "akshare_public"
-        fallback = True
-        fallback_reason = str(first_exc)
-        frame, name = _fetch_akshare_1m(normalized, bars)
+    providers = [
+        ("tencent_public_http", _fetch_tencent_1m),
+        ("sina_public_http", _fetch_sina_1m),
+        ("eastmoney_public_http", _fetch_eastmoney_1m),
+        ("akshare_public", _fetch_akshare_1m),
+    ]
+    attempts = []
+    frame = name = source = None
+    for provider_name, provider in providers:
+        try:
+            frame, name = provider(normalized, bars)
+            source = provider_name
+            attempts.append({"source": provider_name, "ok": True})
+            break
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            attempts.append({"source": provider_name, "ok": False, "error": error})
+            logger.warning("Intraday provider %s failed for %s: %s", provider_name, normalized, error)
+
+    if frame is None or source is None:
+        details = "; ".join(f"{item['source']} -> {item['error']}" for item in attempts)
+        raise RuntimeError(f"All public intraday providers failed for {normalized}: {details}")
+
+    failed_attempts = [item for item in attempts if not item["ok"]]
+    fallback = bool(failed_attempts)
+    fallback_reason = "; ".join(
+        f"{item['source']}: {item['error']}" for item in failed_attempts
+    ) or None
 
     if not name:
         try:
@@ -330,6 +454,7 @@ def intraday_snapshot(symbol: str, bars: int):
         "source": source,
         "fallback": fallback,
         "fallback_reason": fallback_reason,
+        "source_attempts": attempts,
         "metrics": metrics,
         "one_minute_bars": one_min,
         "five_minute_bars": _resample_5m(frame),

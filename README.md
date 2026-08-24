@@ -66,6 +66,8 @@ uvicorn app.main:app --reload
 
 降级响应尽量沿用原字段，并额外包含 `source`、`fallback: true` 和 `fallback_reason`。`stock_basic` 查询结果会缓存 5 分钟，减少重复请求触发限流。通用查询目前可降级的类型包括 `stock_basic`、`trade_cal`、`daily`、`weekly`、`monthly`、`ths_index` 和 `top_list`；其他 Tushare 专属数据若没有可靠的公开映射，会返回空 `items` 和说明性的 `note`，不会令整个 Action 失败。公开源的更新时间、字段和历史覆盖范围可能与 Tushare 不同。
 
+`/v1/stocks/intraday` 不依赖 Tushare，按腾讯公开行情、新浪公开行情、东方财富直连、AkShare 兼容层的顺序获取 A 股分钟数据。响应中的 `source_attempts` 会列出已经尝试的数据源；发生降级时，`fallback_reason` 会保留每个失败源的异常类型和原因。若全部失败，HTTP 503 的 `detail` 同样包含四路错误，便于从 Render 日志直接定位问题。
+
 ## 安全说明
 
 - 不要把 `.env`、Tushare Token 或 API Secret 提交到 GitHub。

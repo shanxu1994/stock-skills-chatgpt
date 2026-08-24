@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, intraday_snapshot
 from app import services
 from app.services import normalize_symbol
 
@@ -31,8 +31,57 @@ def test_analyze_validates_empty_symbols():
 def test_openapi_has_action_operation_ids():
     schema = client.get("/openapi.json").json()
     assert schema["paths"]["/v1/stocks/analyze"]["post"]["operationId"] == "analyzeStocks"
+    assert schema["paths"]["/v1/stocks/intraday"]["post"]["operationId"] == "analyzeIntraday"
     assert schema["paths"]["/v1/tushare/query"]["post"]["operationId"] == "queryTushare"
     assert "HTTPBearer" in schema["components"]["securitySchemes"]
+
+
+def _minute_frame():
+    pandas = __import__("pandas")
+    return pandas.DataFrame([{
+        "time": f"2026-08-24 09:{30 + i:02d}", "open": 10 + i / 100,
+        "high": 10.02 + i / 100, "low": 9.99 + i / 100,
+        "close": 10.01 + i / 100, "volume": 1000 + i, "amount": 100000 + i,
+    } for i in range(30)])
+
+
+def test_intraday_uses_independent_provider_order(monkeypatch):
+    calls = []
+    def fail(name):
+        def provider(*_):
+            calls.append(name)
+            raise ConnectionError(f"{name} unavailable")
+        return provider
+    monkeypatch.setattr("app.main._fetch_tencent_1m", fail("tencent"))
+    monkeypatch.setattr("app.main._fetch_sina_1m", fail("sina"))
+    monkeypatch.setattr("app.main._fetch_eastmoney_1m", lambda *_: (calls.append("eastmoney") or _minute_frame(), "示例股份"))
+    monkeypatch.setattr("app.main._public_stock_name", lambda *_: None, raising=False)
+
+    result = intraday_snapshot("001309", 30)
+    assert calls == ["tencent", "sina", "eastmoney"]
+    assert result["source"] == "eastmoney_public_http"
+    assert result["fallback"] is True
+    assert [attempt["ok"] for attempt in result["source_attempts"]] == [False, False, True]
+    assert "ConnectionError: tencent unavailable" in result["fallback_reason"]
+
+
+def test_intraday_all_provider_errors_are_reported(monkeypatch):
+    providers = ["tencent", "sina", "eastmoney", "akshare"]
+    for attribute, name in zip([
+        "_fetch_tencent_1m", "_fetch_sina_1m", "_fetch_eastmoney_1m", "_fetch_akshare_1m",
+    ], providers):
+        def fail(*_, provider=name):
+            raise RuntimeError(f"{provider} failed")
+        monkeypatch.setattr(f"app.main.{attribute}", fail)
+
+    try:
+        intraday_snapshot("001309", 30)
+        assert False, "Expected provider chain to fail"
+    except RuntimeError as exc:
+        message = str(exc)
+        for provider in providers:
+            assert provider in message
+            assert f"{provider} failed" in message
 
 
 def test_symbol_normalization_does_not_corrupt_us_tickers():
