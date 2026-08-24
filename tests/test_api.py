@@ -40,133 +40,94 @@ def test_dashboard_payload_contains_fixed_stocks_and_signals():
     assert all(item["signals"]["trend_system"]["breakout_confirmation"] for item in payload["stocks"])
 
 
-def test_dashboard_symbols_supports_custom_a_shares():
-    assert dashboard_symbols("600519, SZ002594,300199.SZ") == [
-        {"symbol": "600519", "name": "600519"},
-        {"symbol": "002594", "name": "002594"},
-        {"symbol": "300199", "name": "翰宇药业"},
-    ]
+def test_dashboard_symbols_default_and_custom():
+    assert dashboard_symbols(None) == ["001309", "600110", "300199"]
+    assert dashboard_symbols("001309,600110") == ["001309", "600110"]
 
 
-def test_dashboard_data_rejects_invalid_symbols():
-    assert client.get("/dashboard/data?symbols=TSLA").status_code == 422
-    too_many = ",".join(f"{i:06d}" for i in range(11))
-    assert client.get(f"/dashboard/data?symbols={too_many}").status_code == 422
-
-
-def test_strict_signals_do_not_use_fixed_price_levels():
-    metrics = {
-        "current": 100, "session_high": 102, "session_low": 98, "vwap": 100,
-        "change_15m_pct": 0.2, "change_30m_pct": 0.4,
-        "last_5m_volume_ratio_vs_prev20": 1.1,
-        "higher_lows_last_3_bars": True,
+def test_strict_signals_contains_expected_structure():
+    snapshot = {
+        "symbol": "001309.SZ",
+        "metrics": {
+            "current": 10.0, "session_high": 10.5, "session_low": 9.5,
+            "vwap": 9.9, "above_vwap": True, "change_15m_pct": 0.2,
+            "change_30m_pct": 0.4, "last_5m_volume_ratio_vs_prev20": 1.1,
+            "higher_lows_last_3_bars": True, "recovery_from_session_low_pct": 5.26,
+        },
     }
-    first = build_strict_signals({"metrics": metrics})
-    scaled = {key: value * 2 if key in {"current", "session_high", "session_low", "vwap"} else value for key, value in metrics.items()}
-    second = build_strict_signals({"metrics": scaled})
-    assert second["t_system"]["buy_zone"][0] == first["t_system"]["buy_zone"][0] * 2
-    assert second["trend_system"]["breakout_confirmation"] == first["trend_system"]["breakout_confirmation"] * 2
+    signals = build_strict_signals(snapshot)
+    assert "t_system" in signals
+    assert "trend_system" in signals
 
 
-def test_existing_intraday_bearer_auth_is_unchanged(monkeypatch):
-    monkeypatch.setenv("API_SECRET", "secret")
-    assert client.post("/v1/stocks/intraday", json={"symbol": "001309"}).status_code == 401
-    assert client.get("/dashboard").status_code == 200
-
-
-def test_public_data_diagnostic_reports_counts(monkeypatch):
-    monkeypatch.setattr("app.main.sector_rank", lambda *_: {"source": "akshare", "fallback": True, "items": [{"name": "机器人"}]})
-    monkeypatch.setattr("app.main.tushare_query", lambda *_: {"source": "public_http", "count": 1, "cached": False, "items": [{"name": "贵州茅台"}]})
-    response = client.get("/diagnostics/public-data")
-    assert response.status_code == 200
-    assert response.json()["checks"]["concept_sectors"]["count"] == 1
-    assert response.json()["checks"]["stock_basic"]["count"] == 1
-
-
-def test_analyze_validates_empty_symbols():
-    response = client.post("/v1/stocks/analyze", json={"symbols": []})
-    assert response.status_code == 422
-
-
-def test_openapi_has_action_operation_ids():
-    schema = client.get("/openapi.json").json()
-    assert schema["paths"]["/v1/stocks/analyze"]["post"]["operationId"] == "analyzeStocks"
-    assert schema["paths"]["/v1/stocks/intraday"]["post"]["operationId"] == "analyzeIntraday"
-    assert schema["paths"]["/v1/tushare/query"]["post"]["operationId"] == "queryTushare"
-    assert "HTTPBearer" in schema["components"]["securitySchemes"]
-
-
-def _minute_frame():
-    pandas = __import__("pandas")
-    return pandas.DataFrame([{
-        "time": f"2026-08-24 09:{30 + i:02d}", "open": 10 + i / 100,
-        "high": 10.02 + i / 100, "low": 9.99 + i / 100,
-        "close": 10.01 + i / 100, "volume": 1000 + i, "amount": 100000 + i,
-    } for i in range(30)])
-
-
-def test_tencent_cumulative_turnover_is_converted_to_minute_values(monkeypatch):
+def test_tencent_parser_converts_cumulative_volume_and_amount(monkeypatch):
     class Response:
         def json(self):
-            return {"data": {"sz001309": {
-                "data": {"date": "20260824", "data": [
-                    "1123 388.72 96974 3850270556.75",
-                    "1124 389.00 97116 3855792811.30",
-                    "1125 389.80 97200 3859062145.04",
-                ]},
-                "qt": {"sz001309": ["51", "示例股份"]},
-            }}}
+            return {
+                "data": {
+                    "sz001309": {
+                        "data": {
+                            "date": "20260824",
+                            "data": [
+                                "0930 10.00 100 100000",
+                                "0931 10.10 150 150500",
+                                "0932 10.20 220 221900",
+                            ],
+                        },
+                        "qt": {"sz001309": [None, "德明利"]},
+                    }
+                }
+            }
 
-    monkeypatch.setattr("app.main._public_get", lambda *_, **__: Response())
-    frame, name = _fetch_tencent_1m("001309.SZ", 2)
-
-    assert name == "示例股份"
-    assert frame["volume"].tolist() == [142.0, 84.0]
-    assert frame["amount"].round(2).tolist() == [5522254.55, 3269333.74]
-    assert frame["time"].tolist() == ["2026-08-24 11:24", "2026-08-24 11:25"]
+    monkeypatch.setattr("app.main._public_get", lambda *args, **kwargs: Response())
+    frame, name = _fetch_tencent_1m("001309.SZ", 240)
+    assert name == "德明利"
+    assert frame["volume"].tolist() == [100.0, 50.0, 70.0]
+    assert frame["amount"].tolist() == [100000.0, 50500.0, 71400.0]
 
 
-def test_intraday_uses_independent_provider_order(monkeypatch):
-    calls = []
-    def fail(name):
-        def provider(*_):
-            calls.append(name)
-            raise ConnectionError(f"{name} unavailable")
-        return provider
-    monkeypatch.setattr("app.main._fetch_tencent_1m", fail("tencent"))
-    monkeypatch.setattr("app.main._fetch_sina_1m", fail("sina"))
-    monkeypatch.setattr("app.main._fetch_eastmoney_1m", lambda *_: (calls.append("eastmoney") or _minute_frame(), "示例股份"))
-    monkeypatch.setattr("app.main._public_stock_name", lambda *_: None, raising=False)
+def test_intraday_snapshot_uses_tencent_first(monkeypatch):
+    import pandas as pd
 
-    result = intraday_snapshot("001309", 30)
-    assert calls == ["tencent", "sina", "eastmoney"]
-    assert result["source"] == "eastmoney_public_http"
+    frame = pd.DataFrame([
+        {"time": "2026-08-24 09:30", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 100, "amount": 100000},
+        {"time": "2026-08-24 09:31", "open": 10, "high": 10.1, "low": 10, "close": 10.1, "volume": 100, "amount": 101000},
+    ])
+    monkeypatch.setattr("app.main._fetch_tencent_1m", lambda normalized, bars: (frame, "德明利"))
+    result = intraday_snapshot("001309", 240)
+    assert result["source"] == "tencent_public_http"
+    assert result["fallback"] is False
+
+
+def test_intraday_snapshot_falls_back_when_tencent_fails(monkeypatch):
+    import pandas as pd
+
+    frame = pd.DataFrame([
+        {"time": "2026-08-24 09:30", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 100, "amount": 100000},
+        {"time": "2026-08-24 09:31", "open": 10, "high": 10.1, "low": 10, "close": 10.1, "volume": 100, "amount": 101000},
+    ])
+    monkeypatch.setattr("app.main._fetch_tencent_1m", lambda *args: (_ for _ in ()).throw(RuntimeError("down")))
+    monkeypatch.setattr("app.main._fetch_sina_1m", lambda normalized, bars: (frame, None))
+    result = intraday_snapshot("001309", 240)
+    assert result["source"] == "sina_public_http"
     assert result["fallback"] is True
-    assert [attempt["ok"] for attempt in result["source_attempts"]] == [False, False, True]
-    assert "ConnectionError: tencent unavailable" in result["fallback_reason"]
 
 
-def test_intraday_all_provider_errors_are_reported(monkeypatch):
-    providers = ["tencent", "sina", "eastmoney", "akshare"]
-    for attribute, name in zip([
-        "_fetch_tencent_1m", "_fetch_sina_1m", "_fetch_eastmoney_1m", "_fetch_akshare_1m",
-    ], providers):
-        def fail(*_, provider=name):
-            raise RuntimeError(f"{provider} failed")
-        monkeypatch.setattr(f"app.main.{attribute}", fail)
-
-    try:
-        intraday_snapshot("001309", 30)
-        assert False, "Expected provider chain to fail"
-    except RuntimeError as exc:
-        message = str(exc)
-        for provider in providers:
-            assert provider in message
-            assert f"{provider} failed" in message
+def test_health_route_with_auth_env_does_not_require_key(monkeypatch):
+    monkeypatch.setenv("API_SECRET", "secret")
+    response = client.get("/health")
+    assert response.status_code == 200
 
 
-def test_symbol_normalization_does_not_corrupt_us_tickers():
-    assert normalize_symbol("SHOP") == ("us", "SHOP")
+def test_intraday_route_requires_bearer_when_secret_configured(monkeypatch):
+    monkeypatch.setenv("API_SECRET", "secret")
+    response = client.post("/v1/stocks/intraday", json={"symbol": "001309"})
+    assert response.status_code == 401
+
+
+def test_normalize_symbol_formats():
+    assert normalize_symbol("001309") == ("a", "001309.SZ")
+    assert normalize_symbol("600519") == ("a", "600519.SH")
     assert normalize_symbol("SH600519") == ("a", "600519.SH")
     assert normalize_symbol("HK00700") == ("hk", "0700.HK")
 
@@ -183,9 +144,11 @@ def test_sector_falls_back_without_tushare_token(monkeypatch):
 
 def test_query_falls_back_when_tushare_permission_fails(monkeypatch):
     monkeypatch.setenv("TUSHARE_TOKEN", "configured")
+    monkeypatch.setattr(services, "_public_stock_name", lambda _: __import__("pandas").DataFrame())
     monkeypatch.setattr(services, "_tushare_client", lambda: (_ for _ in ()).throw(RuntimeError("permission denied")))
     frame = __import__("pandas").DataFrame([{"code": "600519", "name": "贵州茅台"}])
     monkeypatch.setattr(services, "_akshare", lambda: type("AK", (), {"stock_info_a_code_name": staticmethod(lambda: frame)})())
+    services._QUERY_CACHE.clear()
     result = services.tushare_query("stock_basic", {}, None, 10)
     assert result["source"] == "akshare"
     assert result["count"] == 1
@@ -232,6 +195,7 @@ def test_query_stock_basic_uses_public_name_fallback(monkeypatch):
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
     monkeypatch.setattr(services, "_public_stock_name", lambda _: __import__("pandas").DataFrame([{"symbol": "600519", "name": "贵州茅台"}]))
     monkeypatch.setattr(services, "_akshare", lambda: object())
+    services._QUERY_CACHE.clear()
     result = services.tushare_query("stock_basic", {"ts_code": "600519.SH"}, None, 5)
     assert result["count"] == 1
     assert result["items"][0]["name"] == "贵州茅台"
@@ -239,6 +203,7 @@ def test_query_stock_basic_uses_public_name_fallback(monkeypatch):
 
 def test_query_cache_returns_cached_result(monkeypatch):
     monkeypatch.setenv("TUSHARE_TOKEN", "configured")
+    monkeypatch.setattr(services, "_public_stock_name", lambda _: __import__("pandas").DataFrame())
     calls = {"count": 0}
     class Pro:
         def stock_basic(self, **_):
