@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from app.main import app, intraday_snapshot
+from app.main import app, _fetch_tencent_1m, intraday_snapshot
 from app import services
 from app.services import normalize_symbol
 
@@ -43,6 +43,27 @@ def _minute_frame():
         "high": 10.02 + i / 100, "low": 9.99 + i / 100,
         "close": 10.01 + i / 100, "volume": 1000 + i, "amount": 100000 + i,
     } for i in range(30)])
+
+
+def test_tencent_cumulative_turnover_is_converted_to_minute_values(monkeypatch):
+    class Response:
+        def json(self):
+            return {"data": {"sz001309": {
+                "data": {"date": "20260824", "data": [
+                    "1123 388.72 96974 3850270556.75",
+                    "1124 389.00 97116 3855792811.30",
+                    "1125 389.80 97200 3859062145.04",
+                ]},
+                "qt": {"sz001309": ["51", "示例股份"]},
+            }}}
+
+    monkeypatch.setattr("app.main._public_get", lambda *_, **__: Response())
+    frame, name = _fetch_tencent_1m("001309.SZ", 2)
+
+    assert name == "示例股份"
+    assert frame["volume"].tolist() == [142.0, 84.0]
+    assert frame["amount"].round(2).tolist() == [5522254.55, 3269333.74]
+    assert frame["time"].tolist() == ["2026-08-24 11:24", "2026-08-24 11:25"]
 
 
 def test_intraday_uses_independent_provider_order(monkeypatch):
