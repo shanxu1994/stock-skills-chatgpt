@@ -41,8 +41,12 @@ def test_dashboard_payload_contains_fixed_stocks_and_signals():
 
 
 def test_dashboard_symbols_default_and_custom():
-    assert dashboard_symbols(None) == ["001309", "600110", "300199"]
-    assert dashboard_symbols("001309,600110") == ["001309", "600110"]
+    default_items = dashboard_symbols(None)
+    assert [item["symbol"] for item in default_items] == ["001309", "600110", "300199"]
+    assert [item["name"] for item in default_items] == ["德明利", "诺德股份", "翰宇药业"]
+
+    custom_items = dashboard_symbols("001309,600110")
+    assert [item["symbol"] for item in custom_items] == ["001309", "600110"]
 
 
 def test_strict_signals_contains_expected_structure():
