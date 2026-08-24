@@ -209,6 +209,16 @@ def _fetch_tencent_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | N
     frame["open"] = frame["close"].shift(1).fillna(frame["close"])
     frame["high"] = frame[["open", "close"]].max(axis=1)
     frame["low"] = frame[["open", "close"]].min(axis=1)
+    # Tencent's third and fourth fields are session-cumulative volume and
+    # turnover. Convert them before slicing so VWAP, volume ratios and 5-minute
+    # aggregation operate on per-minute values.
+    for column in ["volume", "amount"]:
+        cumulative = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+        increments = cumulative.diff()
+        increments.iloc[0] = cumulative.iloc[0]
+        # A negative delta can occur if the upstream counter resets. Treat the
+        # current cumulative value as the first value of the new segment.
+        frame[column] = increments.where(increments >= 0, cumulative)
     qt = node.get("qt") or {}
     quote = qt.get(symbol) or []
     name = str(quote[1]) if len(quote) > 1 and quote[1] else None
