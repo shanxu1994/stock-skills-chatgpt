@@ -1,5 +1,6 @@
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .auth import require_api_key
@@ -10,12 +11,14 @@ from datetime import date, datetime, timedelta
 import json
 import logging
 import re
+from pathlib import Path
 
 import httpx
 import pandas as pd
 
 
 logger = logging.getLogger(__name__)
+_DASHBOARD_FILE = Path(__file__).with_name("dashboard.html")
 
 
 class HealthResponse(BaseModel):
@@ -45,6 +48,20 @@ app.add_middleware(
 @app.get("/health", operation_id="healthCheck", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+@app.get("/dashboard", include_in_schema=False)
+def dashboard_page():
+    return FileResponse(_DASHBOARD_FILE, media_type="text/html")
+
+
+@app.get("/dashboard/data", include_in_schema=False)
+def dashboard_data():
+    # Only these new, read-only dashboard routes are public. Existing Action
+    # routes retain their Bearer dependency and OpenAPI contract unchanged.
+    from .dashboard import build_dashboard_payload
+
+    return build_dashboard_payload(intraday_snapshot)
 
 
 @app.get("/diagnostics/public-data", operation_id="diagnosePublicData", dependencies=[Depends(require_api_key)])

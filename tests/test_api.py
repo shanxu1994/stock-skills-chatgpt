@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app, _fetch_tencent_1m, intraday_snapshot
 from app import services
+from app.dashboard import build_dashboard_payload, build_strict_signals
 from app.services import normalize_symbol
 
 
@@ -12,6 +13,51 @@ def test_health():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_dashboard_page_is_mobile_ready():
+    response = client.get("/dashboard")
+    assert response.status_code == 200
+    assert 'name="viewport"' in response.text
+
+
+def test_dashboard_payload_contains_fixed_stocks_and_signals():
+    def loader(symbol, bars):
+        assert bars == 240
+        return {
+            "symbol": symbol, "name": None, "as_of": "2026-08-24 10:00",
+            "metrics": {
+                "current": 10.10, "session_high": 10.30, "session_low": 9.90,
+                "vwap": 10.05, "change_15m_pct": 0.3, "change_30m_pct": 0.5,
+                "last_5m_volume_ratio_vs_prev20": 1.2,
+                "higher_lows_last_3_bars": True,
+                "recovery_from_session_low_pct": 2.02,
+            },
+        }
+    payload = build_dashboard_payload(loader)
+    assert [item["name"] for item in payload["stocks"]] == ["德明利", "诺德股份"]
+    assert all(item["signals"]["t_system"]["buy_zone"] for item in payload["stocks"])
+    assert all(item["signals"]["trend_system"]["breakout_confirmation"] for item in payload["stocks"])
+
+
+def test_strict_signals_do_not_use_fixed_price_levels():
+    metrics = {
+        "current": 100, "session_high": 102, "session_low": 98, "vwap": 100,
+        "change_15m_pct": 0.2, "change_30m_pct": 0.4,
+        "last_5m_volume_ratio_vs_prev20": 1.1,
+        "higher_lows_last_3_bars": True,
+    }
+    first = build_strict_signals({"metrics": metrics})
+    scaled = {key: value * 2 if key in {"current", "session_high", "session_low", "vwap"} else value for key, value in metrics.items()}
+    second = build_strict_signals({"metrics": scaled})
+    assert second["t_system"]["buy_zone"][0] == first["t_system"]["buy_zone"][0] * 2
+    assert second["trend_system"]["breakout_confirmation"] == first["trend_system"]["breakout_confirmation"] * 2
+
+
+def test_existing_intraday_bearer_auth_is_unchanged(monkeypatch):
+    monkeypatch.setenv("API_SECRET", "secret")
+    assert client.post("/v1/stocks/intraday", json={"symbol": "001309"}).status_code == 401
+    assert client.get("/dashboard").status_code == 200
 
 
 def test_public_data_diagnostic_reports_counts(monkeypatch):
