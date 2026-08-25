@@ -46,3 +46,5 @@ jobs:
             git commit -m 'Update Render snapshot probe for 001309'
             git push
           fi
+
+# second push intentionally triggers this now-registered workflow
