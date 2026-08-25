@@ -1,6 +1,11 @@
 name: realtime-stock-bridge
 
 on:
+  push:
+    branches:
+      - engineering/realtime-stock-bridge
+    paths:
+      - '.github/workflows/realtime_stock_bridge.yml'
   workflow_dispatch:
     inputs:
       symbols:
@@ -19,7 +24,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: realtime-stock-bridge-${{ github.event.inputs.target_ref || 'main' }}
+  group: realtime-stock-bridge-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -34,8 +39,14 @@ jobs:
         id: target
         env:
           INPUT_TARGET: ${{ github.event.inputs.target_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref_name }}
         run: |
-          TARGET="${INPUT_TARGET:-main}"
+          if [ "$EVENT_NAME" = "push" ]; then
+            TARGET="$EVENT_REF"
+          else
+            TARGET="${INPUT_TARGET:-main}"
+          fi
           case "$TARGET" in
             main|engineering/realtime-stock-bridge) ;;
             *) echo "Unsupported target_ref: $TARGET"; exit 2 ;;
@@ -52,11 +63,13 @@ jobs:
         id: gate
         env:
           INPUT_SYMBOLS: ${{ github.event.inputs.symbols }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           python - <<'PY'
           import datetime as dt, os, re
           from zoneinfo import ZoneInfo
-          manual = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+          event=os.environ.get('EVENT_NAME')
+          manual = event in {'workflow_dispatch','push'}
           now = dt.datetime.now(ZoneInfo('Asia/Shanghai'))
           minute = now.hour * 60 + now.minute
           trading = now.weekday() < 5 and ((570 <= minute <= 690) or (780 <= minute <= 900))
@@ -72,7 +85,7 @@ jobs:
               f.write(f"run={'true' if (manual or trading) else 'false'}\n")
               f.write(f"symbols={','.join(symbols)}\n")
               f.write(f"shanghai_time={now.isoformat()}\n")
-          print('manual=',manual,'trading=',trading,'symbols=',symbols,'time=',now.isoformat())
+          print('event=',event,'manual=',manual,'trading=',trading,'symbols=',symbols,'time=',now.isoformat())
           PY
 
       - name: Fetch snapshots from Render
