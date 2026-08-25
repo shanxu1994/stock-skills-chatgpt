@@ -1,0 +1,8 @@
+{
+  "probe": "chatgpt-github-readback",
+  "symbol": "001309",
+  "price": 396.94,
+  "vwap": 392.40,
+  "timestamp": "2026-08-25 11:30:00",
+  "expected": "read-back-exactly"
+}
