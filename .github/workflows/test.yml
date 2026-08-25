@@ -18,3 +18,59 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt pytest
       - run: pytest -q
+
+  live-four-stock-acceptance:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Validate live intraday and daily data for four A-shares
+        run: |
+          python - <<'PY'
+          import json
+          from app.analysis_data import unified_analysis_data
+
+          # First three are the production acceptance set; 600519 is deliberately
+          # outside the bridge cache set to prove first-use/general A-share support.
+          symbols = ['001309', '600110', '300209', '600519']
+          results = []
+          for symbol in symbols:
+              payload = unified_analysis_data(symbol)
+              meta = payload.get('meta') or {}
+              intraday = payload.get('intraday') or {}
+              daily = payload.get('daily') or {}
+              indicators = daily.get('indicators') or {}
+              required = ['ma5','ma10','ma20','macd','rsi14','bias_ma5_pct']
+              missing = [key for key in required if indicators.get(key) is None]
+              result = {
+                  'requested': symbol,
+                  'symbol': payload.get('symbol'),
+                  'name': payload.get('name'),
+                  'partial': meta.get('partial'),
+                  'intraday_available': meta.get('intraday_available'),
+                  'intraday_source': meta.get('intraday_source'),
+                  'intraday_as_of': meta.get('intraday_as_of'),
+                  'daily_available': meta.get('daily_available'),
+                  'daily_source': meta.get('daily_source'),
+                  'daily_as_of': meta.get('daily_as_of'),
+                  'daily_fallback': meta.get('daily_fallback'),
+                  'daily_attempts': daily.get('source_attempts'),
+                  'daily_points': daily.get('data_points'),
+                  'missing_indicators': missing,
+                  'parameters_changed': (payload.get('strategy_contract') or {}).get('parameters_changed'),
+              }
+              print(json.dumps(result, ensure_ascii=False))
+              results.append(result)
+              assert meta.get('intraday_available') is True, result
+              assert meta.get('daily_available') is True, result
+              assert not missing, result
+              assert result['parameters_changed'] is False, result
+          with open('/tmp/live-four-stock-results.json','w',encoding='utf-8') as f:
+              json.dump(results,f,ensure_ascii=False,indent=2)
+          PY

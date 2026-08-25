@@ -1,0 +1,145 @@
+name: realtime-stock-bridge
+
+on:
+  push:
+    branches:
+      - engineering/realtime-stock-bridge
+    paths:
+      - '.github/workflows/realtime_stock_bridge.yml'
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: 'Comma-separated 6-digit A-share symbols'
+        required: false
+        default: '001309,600110,300209'
+      target_ref:
+        description: 'Branch to write snapshots to; use engineering branch for acceptance'
+        required: false
+        default: 'main'
+  schedule:
+    - cron: '*/5 1-3 * * 1-5'
+    - cron: '*/5 5-7 * * 1-5'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: realtime-stock-bridge-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RENDER_BASE_URL: https://stock-skills-chatgpt-p4vq.onrender.com
+  DEFAULT_SYMBOLS: 001309,600110,300209
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target ref
+        id: target
+        env:
+          INPUT_TARGET: ${{ github.event.inputs.target_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then TARGET="$EVENT_REF"; else TARGET="${INPUT_TARGET:-main}"; fi
+          case "$TARGET" in main|engineering/realtime-stock-bridge) ;; *) echo "Unsupported target_ref: $TARGET"; exit 2 ;; esac
+          echo "ref=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve symbols and market session
+        id: gate
+        env:
+          INPUT_SYMBOLS: ${{ github.event.inputs.symbols }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python - <<'PY'
+          import datetime as dt, os, re
+          from zoneinfo import ZoneInfo
+          event=os.environ.get('EVENT_NAME'); manual=event in {'workflow_dispatch','push'}
+          now=dt.datetime.now(ZoneInfo('Asia/Shanghai')); minute=now.hour*60+now.minute
+          trading=now.weekday()<5 and ((570<=minute<=690) or (780<=minute<=900))
+          raw=(os.environ.get('INPUT_SYMBOLS') or os.environ.get('DEFAULT_SYMBOLS') or '').strip(); symbols=[]
+          for item in raw.split(','):
+              code=item.strip()
+              if code and re.fullmatch(r'\d{6}',code) and code not in symbols: symbols.append(code)
+          if not symbols: raise SystemExit('No valid 6-digit A-share symbols supplied')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write(f"run={'true' if (manual or trading) else 'false'}\n"); f.write(f"symbols={','.join(symbols)}\n")
+          print('event=',event,'trading=',trading,'symbols=',symbols,'time=',now.isoformat())
+          PY
+
+      - name: Fetch snapshots and reuse last good daily data
+        if: steps.gate.outputs.run == 'true'
+        env:
+          SYMBOLS: ${{ steps.gate.outputs.symbols }}
+        run: |
+          set -euo pipefail
+          mkdir -p data/realtime
+          IFS=',' read -ra CODES <<< "$SYMBOLS"
+          for code in "${CODES[@]}"; do
+            tmp="data/realtime/.${code}.tmp.json"; out="data/realtime/${code}.json"
+            curl -fL --connect-timeout 15 --max-time 90 --retry 3 --retry-delay 2 "$RENDER_BASE_URL/public/analysis-data/${code}" -o "$tmp"
+            CODE="$code" TMP="$tmp" OUT="$out" python - <<'PY'
+          import datetime as dt, json, os
+          from zoneinfo import ZoneInfo
+          code,path,out=os.environ['CODE'],os.environ['TMP'],os.environ['OUT']
+          with open(path,encoding='utf-8') as f: d=json.load(f)
+          assert str(d.get('symbol','')).startswith(code), f'symbol mismatch: {d.get("symbol")}'
+          now=dt.datetime.now(ZoneInfo('Asia/Shanghai'))
+          meta=d.setdefault('meta',{}); daily=d.get('daily') or {}
+          reused=False
+          if not meta.get('daily_available', daily.get('available',True)) and os.path.exists(out):
+              try:
+                  with open(out,encoding='utf-8') as f: old=json.load(f)
+                  old_daily=old.get('daily') or {}; old_meta=old.get('meta') or {}
+                  old_ok=old_meta.get('daily_available', old_daily.get('available', bool(old_daily.get('indicators'))))
+                  if old_ok and old_daily.get('indicators'):
+                      failure=daily.get('error') or meta.get('daily_error')
+                      d['daily']=old_daily; reused=True
+                      meta.update({'daily_available':True,'daily_source':f"cached:{old_daily.get('source') or 'previous_good_snapshot'}",'daily_as_of':old_daily.get('as_of'),'daily_fallback':True,'daily_error':failure,'partial':False})
+                      d['daily_cache']={'reused':True,'reason':'live_daily_providers_failed','live_error':failure,'cached_as_of':old_daily.get('as_of')}
+              except Exception as exc:
+                  d['daily_cache']={'reused':False,'error':f'{type(exc).__name__}: {exc}'}
+          d.setdefault('bridge_meta',{}).update({'schema_version':1,'requested_symbol':code,'snapshot_at':now.isoformat(),'transport':'tencent/render -> github-actions -> github-json','strategy_parameters_changed':False,'daily_cache_reused':reused})
+          with open(path,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,separators=(',',':'))
+          PY
+            mv "$tmp" "$out"
+          done
+
+      - name: Build stable manifest
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          python - <<'PY'
+          import datetime as dt, glob, json
+          from zoneinfo import ZoneInfo
+          items=[]
+          for path in sorted(glob.glob('data/realtime/*.json')):
+              if path.endswith('/manifest.json'): continue
+              with open(path,encoding='utf-8') as f: d=json.load(f)
+              meta=d.get('meta') or {}; intraday=d.get('intraday') or {}; metrics=intraday.get('metrics') or {}; bridge=d.get('bridge_meta') or {}
+              items.append({'symbol':d.get('symbol'),'name':d.get('name'),'path':path,'generated_at':d.get('generated_at'),'intraday_as_of':meta.get('intraday_as_of') or intraday.get('as_of'),'current':metrics.get('current'),'partial':meta.get('partial',False),'daily_cache_reused':bridge.get('daily_cache_reused',False),'daily_as_of':meta.get('daily_as_of')})
+          manifest={'schema_version':1,'updated_at':dt.datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),'strategy_contract':'existing-strict-entry-v1','parameters_changed':False,'stocks':items}
+          with open('data/realtime/manifest.json','w',encoding='utf-8') as f: json.dump(manifest,f,ensure_ascii=False,separators=(',',':'))
+          PY
+
+      - name: Commit snapshots safely to target ref
+        if: steps.gate.outputs.run == 'true'
+        env:
+          TARGET_REF: ${{ steps.target.outputs.ref }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'; git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/realtime/
+          if git diff --cached --quiet; then echo 'No snapshot change.'; exit 0; fi
+          git commit -m "Update realtime stock snapshots"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin "$TARGET_REF" && git push origin "HEAD:$TARGET_REF"; then exit 0; fi
+            echo "Push attempt $attempt failed; retrying..."; sleep $((attempt*3))
+          done
+          exit 1

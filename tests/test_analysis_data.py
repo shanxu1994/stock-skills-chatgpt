@@ -44,7 +44,7 @@ def test_unified_endpoint_reuses_payload(monkeypatch):
         "symbol": "001309.SZ",
         "strategy_contract": {"parameters_changed": False},
         "intraday": {"source": "tencent_public_http"},
-        "daily": {"source": "eastmoney_public_http", "indicators": {"ma5": 400.0}},
+        "daily": {"source": "tencent_public_http", "indicators": {"ma5": 400.0}},
     })
     response = client.get("/public/analysis-data/001309")
     assert response.status_code == 200
@@ -59,13 +59,27 @@ def test_unified_endpoint_rejects_non_six_digit_symbol():
     assert response.status_code == 422
 
 
-def test_daily_snapshot_prefers_public_provider(monkeypatch):
+def test_daily_snapshot_prefers_tencent_provider(monkeypatch):
     frame = _daily_frame([100.0] * 60)
+    monkeypatch.setattr(analysis_data, "_fetch_tencent_daily", lambda normalized, days: (frame, "测试股"))
+    monkeypatch.setattr(analysis_data, "_fetch_eastmoney_daily", lambda normalized, days: (_ for _ in ()).throw(AssertionError("Eastmoney should not run")))
+    result = analysis_data.daily_snapshot("001309", 60)
+    assert result["source"] == "tencent_public_http"
+    assert result["name"] == "测试股"
+    assert result["fallback"] is False
+    assert result["indicators"]["ma20"] == 100.0
+
+
+def test_daily_snapshot_falls_back_after_tencent_failure(monkeypatch):
+    frame = _daily_frame([100.0] * 60)
+    monkeypatch.setattr(analysis_data, "_fetch_tencent_daily", lambda normalized, days: (_ for _ in ()).throw(RuntimeError("Tencent unavailable")))
     monkeypatch.setattr(analysis_data, "_fetch_eastmoney_daily", lambda normalized, days: (frame, "测试股"))
     result = analysis_data.daily_snapshot("001309", 60)
     assert result["source"] == "eastmoney_public_http"
-    assert result["name"] == "测试股"
-    assert result["indicators"]["ma20"] == 100.0
+    assert result["fallback"] is True
+    assert result["source_attempts"][0]["source"] == "tencent_public_http"
+    assert result["source_attempts"][0]["ok"] is False
+    assert result["source_attempts"][1]["ok"] is True
 
 
 def test_unified_payload_survives_daily_failure_when_intraday_is_available(monkeypatch):
