@@ -2,8 +2,9 @@
 
 from contextlib import asynccontextmanager
 from html import escape
+import re
 
-from fastapi import HTTPException, Query
+from fastapi import HTTPException, Path, Query
 from fastapi.responses import HTMLResponse
 
 from .main import app, intraday_snapshot
@@ -19,27 +20,13 @@ def _load_public_intraday(symbol: str, bars: int):
         raise HTTPException(status_code=502, detail=f"Upstream data request failed: {exc}") from exc
 
 
-@app.get("/public/intraday", operation_id="publicIntraday", include_in_schema=True)
-def public_intraday(
-    symbol: str = Query(..., min_length=6, max_length=20, description="A-share code, e.g. 001309"),
-    bars: int = Query(240, ge=30, le=600, description="Minute bars requested"),
-):
-    """Public read-only A-share intraday snapshot for research.
-
-    Reuses the same Tencent-first minute pipeline as the authenticated Action
-    and MCP tool. No credentials, writes, account data, or private data are
-    exposed by this endpoint.
-    """
-    return _load_public_intraday(symbol, bars)
+def _validate_fixed_symbol(symbol: str) -> str:
+    if not re.fullmatch(r"\d{6}", symbol):
+        raise HTTPException(status_code=422, detail="symbol must be a 6-digit A-share code")
+    return symbol
 
 
-@app.get("/public/intraday/view", response_class=HTMLResponse, include_in_schema=False)
-def public_intraday_view(
-    symbol: str = Query(..., min_length=6, max_length=20, description="A-share code, e.g. 001309"),
-    bars: int = Query(240, ge=30, le=600, description="Minute bars requested"),
-):
-    """Human-readable, crawl-friendly view of the public intraday snapshot."""
-    snapshot = _load_public_intraday(symbol, bars)
+def _intraday_html(snapshot: dict, symbol: str) -> HTMLResponse:
     metrics = snapshot.get("metrics") or {}
     one_minute = snapshot.get("one_minute_bars") or []
 
@@ -69,6 +56,7 @@ def public_intraday_view(
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<meta name=\"robots\" content=\"index,follow\">
 <title>{title} 分时行情</title>
 <style>
 body{{font-family:system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:24px;line-height:1.5;color:#111}}
@@ -100,11 +88,42 @@ small{{color:#666}}
     return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
 
 
+@app.get("/public/intraday", operation_id="publicIntraday", include_in_schema=True)
+def public_intraday(
+    symbol: str = Query(..., min_length=6, max_length=20, description="A-share code, e.g. 001309"),
+    bars: int = Query(240, ge=30, le=600, description="Minute bars requested"),
+):
+    return _load_public_intraday(symbol, bars)
+
+
+@app.get("/public/intraday/view", response_class=HTMLResponse, include_in_schema=False)
+def public_intraday_view(
+    symbol: str = Query(..., min_length=6, max_length=20, description="A-share code, e.g. 001309"),
+    bars: int = Query(240, ge=30, le=600, description="Minute bars requested"),
+):
+    return _intraday_html(_load_public_intraday(symbol, bars), symbol)
+
+
+@app.get("/public/intraday/{symbol}", operation_id="publicIntradayFixed", include_in_schema=True)
+def public_intraday_fixed(
+    symbol: str = Path(..., description="Six-digit A-share code, e.g. 001309"),
+):
+    """Stable, query-free public JSON URL backed by the live Tencent-first pipeline."""
+    symbol = _validate_fixed_symbol(symbol)
+    return _load_public_intraday(symbol, 240)
+
+
+@app.get("/public/intraday/{symbol}/view", response_class=HTMLResponse, include_in_schema=False)
+def public_intraday_fixed_view(
+    symbol: str = Path(..., description="Six-digit A-share code, e.g. 001309"),
+):
+    """Stable, query-free human-readable intraday page for crawlers and browsers."""
+    symbol = _validate_fixed_symbol(symbol)
+    return _intraday_html(_load_public_intraday(symbol, 240), symbol)
+
+
 @asynccontextmanager
 async def lifespan(_app):
-    # Streamable HTTP MCP requires its session manager to run for the lifetime
-    # of the host application. The existing FastAPI app has no custom lifespan,
-    # so this wrapper does not replace any application startup/shutdown work.
     async with mcp.session_manager.run():
         yield
 
