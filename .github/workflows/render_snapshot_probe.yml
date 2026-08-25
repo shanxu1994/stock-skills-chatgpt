@@ -13,8 +13,11 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout latest main
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Fetch real Render snapshot
         run: |
@@ -35,7 +38,7 @@ jobs:
           print('current=', ((d.get('intraday') or {}).get('metrics') or {}).get('current'))
           PY
 
-      - name: Commit snapshot
+      - name: Commit snapshot onto latest main
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -44,7 +47,6 @@ jobs:
             echo 'No snapshot change to commit.'
           else
             git commit -m 'Update Render snapshot probe for 001309'
-            git push
+            git pull --rebase origin main
+            git push origin HEAD:main
           fi
-
-# second push intentionally triggers this now-registered workflow
