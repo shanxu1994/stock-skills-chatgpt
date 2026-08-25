@@ -5,7 +5,7 @@ from datetime import datetime
 import re
 from typing import Any, Callable
 
-from .t_strategy import TState, evaluate_t_state
+from .t_strategy import TState, evaluate_daily_trend, evaluate_t_state
 
 
 DASHBOARD_STOCKS = (
@@ -20,7 +20,9 @@ def _price(value: float) -> float:
     return round(float(value), 2)
 
 
-def build_strict_signals(snapshot: dict[str, Any]) -> dict[str, Any]:
+def build_strict_signals(
+    snapshot: dict[str, Any], daily_snapshot: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Build explainable signals while preserving the dashboard response shape."""
     metrics = snapshot["metrics"]
     current = float(metrics["current"])
@@ -41,7 +43,18 @@ def build_strict_signals(snapshot: dict[str, Any]) -> dict[str, Any]:
     breakout = high + max(current * 0.001, day_range * 0.04)
 
     minute_bars = snapshot.get("one_minute_bars") or []
-    state_result = evaluate_t_state(minute_bars)
+    daily_gate = None
+    daily_bars = (daily_snapshot or {}).get("recent_daily_bars") or []
+    if daily_bars:
+        session_date = str(snapshot.get("as_of") or "")[:10]
+        daily_gate = evaluate_daily_trend(daily_bars, before_date=session_date or None)
+    elif daily_snapshot is not None:
+        daily_gate = {
+            "permission": "BLOCK", "regime": "DAILY_DATA_UNAVAILABLE",
+            "score": 0, "reasons": ["日线数据不可用，禁止仅凭分时入场"],
+            "as_of": None,
+        }
+    state_result = evaluate_t_state(minute_bars, daily_gate=daily_gate)
     if not minute_bars:
         # Compatibility for callers that only provide aggregate metrics. Being
         # in the price zone is WATCH at most; aggregate data can never confirm.
@@ -89,6 +102,7 @@ def build_strict_signals(snapshot: dict[str, Any]) -> dict[str, Any]:
             "structure": state_result.get("structure"),
             "resonance_score": state_result.get("score", 0),
             "conditions": state_result.get("conditions", {}),
+            "daily_gate": state_result.get("daily_gate") or daily_gate,
             "buy_zone": [_price(support), _price(max(support, buy_upper))],
             "reduce_zone": [_price(reduce_low), _price(high)],
             "invalidation": _price(invalidation),
@@ -128,6 +142,7 @@ def dashboard_symbols(raw_symbols: str | None) -> list[dict[str, str]]:
 def build_dashboard_payload(
     loader: Callable[[str, int], dict[str, Any]],
     configured_stocks: list[dict[str, str]] | None = None,
+    daily_loader: Callable[[str, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     selected = configured_stocks or [dict(item) for item in DASHBOARD_STOCKS]
 
@@ -135,7 +150,17 @@ def build_dashboard_payload(
         try:
             snapshot = loader(configured["symbol"], 240)
             snapshot["name"] = snapshot.get("name") or configured["name"]
-            return {**snapshot, "signals": build_strict_signals(snapshot)}
+            daily = None
+            if daily_loader:
+                try:
+                    daily = daily_loader(configured["symbol"], 120)
+                except Exception as exc:
+                    daily = {"error": f"{type(exc).__name__}: {exc}"}
+            return {
+                **snapshot,
+                "daily": daily,
+                "signals": build_strict_signals(snapshot, daily),
+            }
         except Exception:
             return {
                 **configured,

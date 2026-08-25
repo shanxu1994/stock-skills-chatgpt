@@ -14,6 +14,12 @@ class TState(str, Enum):
     NO_TRADE = "NO_TRADE"
 
 
+class DailyPermission(str, Enum):
+    ALLOW = "ALLOW"
+    CAUTION = "CAUTION"
+    BLOCK = "BLOCK"
+
+
 @dataclass(frozen=True)
 class StrategyConfig:
     min_bars: int = 31
@@ -56,11 +62,99 @@ def _pct_change(frame: pd.DataFrame, bars: int) -> float | None:
     return (float(frame.iloc[-1]["close"]) / base - 1) * 100 if base else None
 
 
+def evaluate_daily_trend(
+    rows: Iterable[dict[str, Any]], *, before_date: str | None = None
+) -> dict[str, Any]:
+    """Decide whether intraday T trading is allowed using completed daily bars."""
+    frame = _frame(rows)
+    if before_date and "trade_date" in frame:
+        dates = pd.to_datetime(frame["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        frame = frame.loc[dates < before_date].reset_index(drop=True)
+    if len(frame) < 20:
+        return {
+            "permission": DailyPermission.BLOCK.value,
+            "regime": "INSUFFICIENT_DATA",
+            "score": 0,
+            "reasons": ["不足20根已完成日K，禁止仅凭分时入场"],
+            "as_of": None,
+        }
+
+    close = frame["close"].astype(float)
+    volume = frame["volume"].astype(float)
+    ma5 = float(close.tail(5).mean())
+    ma10 = float(close.tail(10).mean())
+    ma20 = float(close.tail(20).mean())
+    prior_ma20 = float(close.iloc[-25:-5].mean()) if len(frame) >= 25 else float(close.iloc[:-5].tail(20).mean())
+    current = float(close.iloc[-1])
+    bias_ma5 = (current / ma5 - 1) * 100 if ma5 else 0.0
+    delta = close.diff()
+    gains = delta.clip(lower=0).tail(14).mean()
+    losses = -delta.clip(upper=0).tail(14).mean()
+    if losses == 0 and gains == 0:
+        rsi14 = 50.0
+    elif losses == 0:
+        rsi14 = 100.0
+    else:
+        rsi14 = float(100 - 100 / (1 + gains / losses))
+    volume_ratio = float(volume.tail(5).mean() / volume.tail(20).mean()) if volume.tail(20).mean() > 0 else None
+
+    conditions = {
+        "above_ma20": current >= ma20,
+        "bullish_alignment": ma5 > ma10 > ma20,
+        "ma20_rising": ma20 >= prior_ma20,
+        "not_extended": bias_ma5 <= 5 and rsi14 <= 80,
+    }
+    score = sum(conditions.values())
+    hard_downtrend = current < ma20 and ma5 < ma10 < ma20 and not conditions["ma20_rising"]
+    extended = not conditions["not_extended"]
+    if hard_downtrend or extended:
+        permission = DailyPermission.BLOCK
+        regime = "DOWNTREND" if hard_downtrend else "EXTENDED"
+    elif score >= 3:
+        permission = DailyPermission.ALLOW
+        regime = "UPTREND"
+    else:
+        permission = DailyPermission.CAUTION
+        regime = "RANGE"
+
+    reasons = [f"日线趋势条件 {score}/4"]
+    if hard_downtrend:
+        reasons.append("收盘低于MA20且均线空头排列，暂停做T")
+    elif extended:
+        reasons.append("日线乖离或RSI过热，避免盘中追高")
+    elif permission == DailyPermission.ALLOW:
+        reasons.append("日线趋势允许，等待分时结构确认")
+    else:
+        reasons.append("日线震荡，仅允许更严格的分时确认")
+    return {
+        "permission": permission.value,
+        "regime": regime,
+        "score": score,
+        "conditions": conditions,
+        "reasons": reasons,
+        "as_of": str(frame.iloc[-1].get("trade_date", "")),
+        "metrics": {
+            "close": round(current, 4), "ma5": round(ma5, 4),
+            "ma10": round(ma10, 4), "ma20": round(ma20, 4),
+            "rsi14": round(rsi14, 4), "bias_ma5_pct": round(bias_ma5, 4),
+            "volume_ratio_5_20": round(volume_ratio, 4) if volume_ratio is not None else None,
+        },
+    }
+
+
 def evaluate_t_state(
-    rows: Iterable[dict[str, Any]], config: StrategyConfig | None = None
+    rows: Iterable[dict[str, Any]], config: StrategyConfig | None = None,
+    daily_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate the latest bar using its prefix only; safe for live use and replay."""
     config = config or StrategyConfig()
+    if daily_gate and daily_gate.get("permission") == DailyPermission.BLOCK.value:
+        return {
+            "state": TState.NO_TRADE.value, "structure": None, "score": 0,
+            "conditions": {},
+            "reasons": ["日线门控禁止当日做T", *daily_gate.get("reasons", [])],
+            "daily_gate": daily_gate,
+        }
     frame = _frame(rows)
     if len(frame) < config.min_bars:
         return {
@@ -130,9 +224,15 @@ def evaluate_t_state(
         and (pullback_depth <= 0.045 or bool(breakout_positions))
     )
 
+    required_score = config.min_confirmation_score + (
+        1 if daily_gate and daily_gate.get("permission") == DailyPermission.CAUTION.value else 0
+    )
+    if daily_gate and daily_gate.get("permission") == DailyPermission.CAUTION.value:
+        required_score = min(required_score, len(conditions))
+
     if overheated:
         state = TState.NO_TRADE
-    elif structure and score >= config.min_confirmation_score:
+    elif structure and score >= required_score:
         state = TState.CONFIRMED
     elif near_setup or pullback_structure or breakout_retest:
         state = TState.WATCH
@@ -154,6 +254,8 @@ def evaluate_t_state(
         "structure": structure,
         "score": score,
         "conditions": conditions,
+        "required_score": required_score,
+        "daily_gate": daily_gate,
         "reasons": reasons,
         "diagnostics": {
             "vwap": round(vwap, 4) if vwap is not None else None,

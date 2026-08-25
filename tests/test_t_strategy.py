@@ -1,6 +1,8 @@
-from app.backtest import replay_signals
+import pandas as pd
+
+from app.backtest import replay_market_days, replay_signals
 from app.dashboard import build_strict_signals
-from app.t_strategy import TState, evaluate_t_state
+from app.t_strategy import DailyPermission, TState, evaluate_daily_trend, evaluate_t_state
 
 
 def bar(index, close, volume=1000, low=None, high=None):
@@ -39,6 +41,19 @@ def breakout_retest_bars():
         bar(48, 10.06, 1050, 10.03, 10.08),
         bar(49, 10.12, 1800, 10.08, 10.13),
     ]
+    return rows
+
+
+def daily_bars(direction=1, count=30):
+    dates = pd.bdate_range("2026-06-01", periods=count)
+    rows = []
+    for index, day in enumerate(dates):
+        close = 10 + direction * index * 0.02 + (0.03 if index % 2 else -0.03)
+        rows.append({
+            "trade_date": day.strftime("%Y-%m-%d"), "open": close - 0.01,
+            "high": close + 0.05, "low": close - 0.05, "close": close,
+            "volume": 1000 + index * 5,
+        })
     return rows
 
 
@@ -96,3 +111,42 @@ def test_replay_statistics_and_no_future_leakage():
     assert base["events"] == extended["events"][:len(history)]
     assert base["trigger_count"] >= 1
     assert {"win_rate", "average_return", "average_loss", "profit_loss_ratio", "max_drawdown"} <= base.keys()
+
+
+def test_daily_uptrend_allows_t_and_excludes_current_session_bar():
+    rows = daily_bars()
+    session_date = "2026-07-14"
+    rows.append({
+        "trade_date": session_date, "open": 15, "high": 16, "low": 14,
+        "close": 16, "volume": 9999,
+    })
+    gate = evaluate_daily_trend(rows, before_date=session_date)
+    assert gate["permission"] == DailyPermission.ALLOW.value
+    assert gate["as_of"] < session_date
+
+
+def test_daily_downtrend_blocks_intraday_confirmation():
+    gate = evaluate_daily_trend(daily_bars(direction=-1))
+    assert gate["permission"] == DailyPermission.BLOCK.value
+    signal = evaluate_t_state(breakout_retest_bars(), daily_gate=gate)
+    assert signal["state"] == TState.NO_TRADE.value
+    assert "日线门控禁止" in signal["reasons"][0]
+
+
+def test_multi_day_replay_uses_only_prior_daily_bars():
+    rows = breakout_retest_bars()
+    times = pd.date_range("2026-07-14 09:30", periods=len(rows), freq="min")
+    for item, timestamp in zip(rows, times):
+        item["time"] = timestamp.strftime("%Y-%m-%d %H:%M")
+    result = replay_market_days(rows, daily_bars())
+    assert result["sessions"][0]["daily_gate"]["as_of"] < "2026-07-14"
+    assert result["sessions"][0]["daily_gate"]["permission"] == DailyPermission.ALLOW.value
+
+
+def test_flat_daily_prices_are_not_misclassified_as_rsi_overheated():
+    rows = daily_bars()
+    for item in rows:
+        item["open"] = item["high"] = item["low"] = item["close"] = 10.0
+    gate = evaluate_daily_trend(rows)
+    assert gate["metrics"]["rsi14"] == 50.0
+    assert gate["regime"] != "EXTENDED"

@@ -60,12 +60,13 @@ def dashboard_data(symbols: str | None = None):
     # Only these new, read-only dashboard routes are public. Existing Action
     # routes retain their Bearer dependency and OpenAPI contract unchanged.
     from .dashboard import build_dashboard_payload, dashboard_symbols
+    from .analysis_data import daily_snapshot
 
     try:
         selected = dashboard_symbols(symbols)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return build_dashboard_payload(intraday_snapshot, selected)
+    return build_dashboard_payload(intraday_snapshot, selected, daily_loader=daily_snapshot)
 
 
 @app.get("/diagnostics/public-data", operation_id="diagnosePublicData", dependencies=[Depends(require_api_key)])

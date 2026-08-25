@@ -3,7 +3,43 @@ from __future__ import annotations
 from math import prod
 from typing import Any, Iterable
 
-from .t_strategy import StrategyConfig, TState, evaluate_t_state
+import pandas as pd
+
+from .t_strategy import StrategyConfig, TState, evaluate_daily_trend, evaluate_t_state
+
+
+def _summarize(trades: list[dict[str, Any]], events: list[dict[str, Any]]) -> dict[str, Any]:
+    returns = [trade["return_pct"] for trade in trades]
+    wins = [value for value in returns if value > 0]
+    losses = [value for value in returns if value < 0]
+    average_return = sum(returns) / len(returns) if returns else 0.0
+    average_loss = sum(losses) / len(losses) if losses else 0.0
+    profit_loss_ratio = (
+        (sum(wins) / len(wins)) / abs(average_loss) if wins and losses else None
+    )
+    equity = 1.0
+    peak = 1.0
+    max_drawdown = 0.0
+    for value in returns:
+        equity *= 1 + value
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, (peak - equity) / peak)
+    return {
+        "trigger_count": sum(
+            event["state"] == TState.CONFIRMED.value
+            and (i == 0 or events[i - 1]["state"] != TState.CONFIRMED.value)
+            for i, event in enumerate(events)
+        ),
+        "trade_count": len(trades),
+        "win_rate": len(wins) / len(returns) if returns else 0.0,
+        "average_return": average_return,
+        "average_loss": average_loss,
+        "profit_loss_ratio": profit_loss_ratio,
+        "max_drawdown": max_drawdown,
+        "total_return": prod(1 + value for value in returns) - 1 if returns else 0.0,
+        "trades": trades,
+        "events": events,
+    }
 
 
 def replay_signals(
@@ -13,6 +49,7 @@ def replay_signals(
     stop_loss_pct: float = 0.01,
     take_profit_pct: float = 0.02,
     config: StrategyConfig | None = None,
+    daily_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replay minute bars without look-ahead and summarize completed trades."""
     bars = list(rows)
@@ -21,7 +58,7 @@ def replay_signals(
     position: dict[str, Any] | None = None
 
     for index, bar in enumerate(bars):
-        signal = evaluate_t_state(bars[: index + 1], config)
+        signal = evaluate_t_state(bars[: index + 1], config, daily_gate=daily_gate)
         events.append({"index": index, "state": signal["state"], "structure": signal["structure"]})
 
         if position is not None:
@@ -48,31 +85,42 @@ def replay_signals(
             "return_pct": float(last["close"]) / position["entry_price"] - 1,
         })
 
-    returns = [trade["return_pct"] for trade in trades]
-    wins = [value for value in returns if value > 0]
-    losses = [value for value in returns if value < 0]
-    average_return = sum(returns) / len(returns) if returns else 0.0
-    average_loss = sum(losses) / len(losses) if losses else 0.0
-    profit_loss_ratio = (
-        (sum(wins) / len(wins)) / abs(average_loss) if wins and losses else None
-    )
-    equity = 1.0
-    peak = 1.0
-    max_drawdown = 0.0
-    for value in returns:
-        equity *= 1 + value
-        peak = max(peak, equity)
-        max_drawdown = max(max_drawdown, (peak - equity) / peak)
+    return _summarize(trades, events)
 
-    return {
-        "trigger_count": sum(event["state"] == TState.CONFIRMED.value and (i == 0 or events[i - 1]["state"] != TState.CONFIRMED.value) for i, event in enumerate(events)),
-        "trade_count": len(trades),
-        "win_rate": len(wins) / len(returns) if returns else 0.0,
-        "average_return": average_return,
-        "average_loss": average_loss,
-        "profit_loss_ratio": profit_loss_ratio,
-        "max_drawdown": max_drawdown,
-        "total_return": prod(1 + value for value in returns) - 1 if returns else 0.0,
-        "trades": trades,
-        "events": events,
-    }
+
+def replay_market_days(
+    minute_rows: Iterable[dict[str, Any]],
+    daily_rows: Iterable[dict[str, Any]],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Replay each session with a gate built only from prior completed daily bars."""
+    minute = pd.DataFrame(list(minute_rows))
+    if minute.empty or "time" not in minute:
+        return _summarize([], [])
+    minute["_session"] = pd.to_datetime(minute["time"], errors="coerce").dt.strftime("%Y-%m-%d")
+    all_events: list[dict[str, Any]] = []
+    all_trades: list[dict[str, Any]] = []
+    sessions: list[dict[str, Any]] = []
+    offset = 0
+    daily = list(daily_rows)
+    for session_date, group in minute.dropna(subset=["_session"]).groupby("_session", sort=True):
+        bars = group.drop(columns=["_session"]).to_dict("records")
+        gate = evaluate_daily_trend(daily, before_date=session_date)
+        result = replay_signals(bars, daily_gate=gate, **kwargs)
+        for event in result["events"]:
+            all_events.append({**event, "index": event["index"] + offset, "session": session_date})
+        for trade in result["trades"]:
+            all_trades.append({
+                **trade,
+                "entry_index": trade["entry_index"] + offset,
+                "exit_index": trade["exit_index"] + offset,
+                "session": session_date,
+            })
+        sessions.append({
+            "session": session_date, "daily_gate": gate,
+            "trigger_count": result["trigger_count"], "trade_count": result["trade_count"],
+        })
+        offset += len(bars)
+    summary = _summarize(all_trades, all_events)
+    summary["sessions"] = sessions
+    return summary
