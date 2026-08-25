@@ -1,0 +1,48 @@
+name: render-snapshot-probe
+
+on:
+  push:
+    paths:
+      - '.github/workflows/render_snapshot_probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch real Render snapshot
+        run: |
+          mkdir -p data
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://stock-skills-chatgpt-p4vq.onrender.com/public/analysis-data/001309' \
+            -o data/render_probe_001309.json
+          python - <<'PY'
+          import json
+          p='data/render_probe_001309.json'
+          with open(p,'r',encoding='utf-8') as f:
+              d=json.load(f)
+          assert d.get('symbol'), 'missing symbol'
+          assert d.get('intraday'), 'missing intraday'
+          assert d.get('daily'), 'missing daily'
+          print('symbol=', d.get('symbol'))
+          print('intraday_as_of=', (d.get('meta') or {}).get('intraday_as_of'))
+          print('current=', ((d.get('intraday') or {}).get('metrics') or {}).get('current'))
+          PY
+
+      - name: Commit snapshot
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/render_probe_001309.json
+          if git diff --cached --quiet; then
+            echo 'No snapshot change to commit.'
+          else
+            git commit -m 'Update Render snapshot probe for 001309'
+            git push
+          fi
