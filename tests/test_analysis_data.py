@@ -66,3 +66,37 @@ def test_daily_snapshot_prefers_public_provider(monkeypatch):
     assert result["source"] == "eastmoney_public_http"
     assert result["name"] == "测试股"
     assert result["indicators"]["ma20"] == 100.0
+
+
+def test_unified_payload_survives_daily_failure_when_intraday_is_available(monkeypatch):
+    monkeypatch.setattr(analysis_data, "intraday_snapshot", lambda symbol, bars: {
+        "symbol": "001309.SZ",
+        "name": "德明利",
+        "source": "tencent_public_http",
+        "as_of": "2026-08-25 12:00:00",
+        "fallback": False,
+        "metrics": {"current": 396.94},
+        "one_minute_bars": [{"time": "12:00", "close": 396.94}],
+    })
+    monkeypatch.setattr(analysis_data, "daily_snapshot", lambda symbol, days: (_ for _ in ()).throw(RuntimeError("daily upstream unavailable")))
+
+    payload = analysis_data.unified_analysis_data("001309")
+
+    assert payload["symbol"] == "001309.SZ"
+    assert payload["strategy_contract"]["parameters_changed"] is False
+    assert payload["meta"]["partial"] is True
+    assert payload["meta"]["intraday_available"] is True
+    assert payload["meta"]["daily_available"] is False
+    assert payload["intraday"]["metrics"]["current"] == 396.94
+    assert "daily upstream unavailable" in payload["daily"]["error"]
+
+
+def test_unified_payload_still_fails_when_both_sources_fail(monkeypatch):
+    monkeypatch.setattr(analysis_data, "intraday_snapshot", lambda symbol, bars: (_ for _ in ()).throw(RuntimeError("intraday unavailable")))
+    monkeypatch.setattr(analysis_data, "daily_snapshot", lambda symbol, days: (_ for _ in ()).throw(RuntimeError("daily unavailable")))
+
+    try:
+        analysis_data.unified_analysis_data("001309")
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "Both intraday and daily data failed" in str(exc)
