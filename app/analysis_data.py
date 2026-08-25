@@ -12,7 +12,7 @@ from typing import Any
 import pandas as pd
 
 from . import services as stock_services
-from .main import _eastmoney_secid, _public_get, intraday_snapshot
+from .main import _eastmoney_secid, _public_get, _public_symbol, intraday_snapshot
 
 
 STRICT_POLICY_VERSION = "existing-strict-entry-v1"
@@ -39,6 +39,37 @@ def _normalize_daily_frame(frame: pd.DataFrame, days: int) -> pd.DataFrame:
     if frame.empty:
         raise RuntimeError("No valid daily bars")
     return frame
+
+
+def _fetch_tencent_daily(normalized: str, days: int) -> tuple[pd.DataFrame, str | None]:
+    symbol = _public_symbol(normalized)
+    response = _public_get(
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        params={"param": f"{symbol},day,,,{max(days, 120)},qfq"},
+        referer="https://gu.qq.com/",
+    )
+    payload = response.json()
+    node = (payload.get("data") or {}).get(symbol) or {}
+    rows = node.get("qfqday") or node.get("day") or []
+    if not rows:
+        raise RuntimeError(f"Tencent returned no daily bars (code={payload.get('code')!r})")
+    parsed: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        parsed.append({
+            "trade_date": row[0],
+            "open": row[1],
+            "close": row[2],
+            "high": row[3],
+            "low": row[4],
+            "volume": row[5],
+        })
+    frame = _normalize_daily_frame(pd.DataFrame(parsed), days)
+    qt = node.get("qt") or {}
+    quote = qt.get(symbol) or []
+    name = str(quote[1]) if len(quote) > 1 and quote[1] else None
+    return frame, name
 
 
 def _fetch_eastmoney_daily(normalized: str, days: int) -> tuple[pd.DataFrame, str | None]:
@@ -91,6 +122,7 @@ def daily_snapshot(symbol: str, days: int = 120) -> dict[str, Any]:
         raise RuntimeError("Unified public analysis currently supports A-shares only")
 
     providers = [
+        ("tencent_public_http", _fetch_tencent_daily),
         ("eastmoney_public_http", _fetch_eastmoney_daily),
         ("akshare_public", _fetch_akshare_daily),
     ]
