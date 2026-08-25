@@ -108,8 +108,6 @@ def daily_snapshot(symbol: str, days: int = 120) -> dict[str, Any]:
             attempts.append({"source": source_name, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     if frame is None or source is None:
-        # Final compatibility fallback: reuse the existing history implementation
-        # when the deployment already has Tushare configured.
         try:
             frame, name = stock_services._a_share_history(normalized, days)
             source = "tushare_compatibility_fallback"
@@ -154,12 +152,51 @@ def daily_snapshot(symbol: str, days: int = 120) -> dict[str, Any]:
     }
 
 
-def unified_analysis_data(symbol: str) -> dict[str, Any]:
-    intraday = intraday_snapshot(symbol, 240)
-    daily = daily_snapshot(symbol, 120)
+def _error_snapshot(kind: str, exc: Exception) -> dict[str, Any]:
     return {
-        "symbol": daily["symbol"],
-        "name": intraday.get("name") or daily.get("name"),
+        "available": False,
+        "source": None,
+        "as_of": None,
+        "fallback": True,
+        "error": f"{type(exc).__name__}: {exc}",
+        "kind": kind,
+    }
+
+
+def unified_analysis_data(symbol: str) -> dict[str, Any]:
+    market, normalized = stock_services.normalize_symbol(symbol)
+    if market != "a":
+        raise RuntimeError("Unified public analysis currently supports A-shares only")
+
+    intraday_error = None
+    daily_error = None
+
+    try:
+        intraday = intraday_snapshot(symbol, 240)
+    except Exception as exc:
+        intraday_error = exc
+        intraday = _error_snapshot("intraday", exc)
+
+    try:
+        daily = daily_snapshot(symbol, 120)
+    except Exception as exc:
+        daily_error = exc
+        daily = _error_snapshot("daily", exc)
+
+    if intraday_error is not None and daily_error is not None:
+        raise RuntimeError(
+            "Both intraday and daily data failed for "
+            f"{normalized}: intraday={type(intraday_error).__name__}: {intraday_error}; "
+            f"daily={type(daily_error).__name__}: {daily_error}"
+        )
+
+    name = intraday.get("name") or daily.get("name")
+    intraday_ok = intraday_error is None
+    daily_ok = daily_error is None
+
+    return {
+        "symbol": daily.get("symbol") or intraday.get("symbol") or normalized,
+        "name": name,
         "generated_at": datetime.now().astimezone().isoformat(),
         "strategy_contract": {
             "version": STRICT_POLICY_VERSION,
@@ -169,12 +206,17 @@ def unified_analysis_data(symbol: str) -> dict[str, Any]:
         "intraday": intraday,
         "daily": daily,
         "meta": {
+            "partial": not (intraday_ok and daily_ok),
+            "intraday_available": intraday_ok,
+            "daily_available": daily_ok,
             "intraday_source": intraday.get("source"),
             "intraday_as_of": intraday.get("as_of"),
             "daily_source": daily.get("source"),
             "daily_as_of": daily.get("as_of"),
             "intraday_fallback": intraday.get("fallback"),
             "daily_fallback": daily.get("fallback"),
+            "intraday_error": intraday.get("error"),
+            "daily_error": daily.get("error"),
         },
         "disclaimer": "Market research only; not investment advice.",
     }
