@@ -1,0 +1,152 @@
+name: realtime-stock-bridge
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: 'Comma-separated 6-digit A-share symbols'
+        required: false
+        default: '001309,600110,300209'
+  schedule:
+    # GitHub scheduled workflows have a 5-minute minimum cadence.
+    # UTC windows cover A-share sessions; the script itself enforces Asia/Shanghai trading minutes.
+    - cron: '*/5 1-3 * * 1-5'
+    - cron: '*/5 5-7 * * 1-5'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: realtime-stock-bridge-main
+  cancel-in-progress: false
+
+env:
+  RENDER_BASE_URL: https://stock-skills-chatgpt-p4vq.onrender.com
+  DEFAULT_SYMBOLS: 001309,600110,300209
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve symbols and market session
+        id: gate
+        env:
+          INPUT_SYMBOLS: ${{ github.event.inputs.symbols }}
+        run: |
+          python - <<'PY'
+          import datetime as dt, os, re
+          from zoneinfo import ZoneInfo
+
+          manual = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+          now = dt.datetime.now(ZoneInfo('Asia/Shanghai'))
+          minute = now.hour * 60 + now.minute
+          trading = now.weekday() < 5 and ((570 <= minute <= 690) or (780 <= minute <= 900))
+          raw = (os.environ.get('INPUT_SYMBOLS') or os.environ.get('DEFAULT_SYMBOLS') or '').strip()
+          symbols = []
+          for item in raw.split(','):
+              code = item.strip()
+              if code and re.fullmatch(r'\d{6}', code) and code not in symbols:
+                  symbols.append(code)
+          if not symbols:
+              raise SystemExit('No valid 6-digit A-share symbols supplied')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"run={'true' if (manual or trading) else 'false'}\n")
+              f.write(f"symbols={','.join(symbols)}\n")
+              f.write(f"shanghai_time={now.isoformat()}\n")
+          print('manual=', manual, 'trading=', trading, 'symbols=', symbols, 'time=', now.isoformat())
+          PY
+
+      - name: Fetch snapshots from Render
+        if: steps.gate.outputs.run == 'true'
+        env:
+          SYMBOLS: ${{ steps.gate.outputs.symbols }}
+        run: |
+          set -euo pipefail
+          mkdir -p data/realtime
+          IFS=',' read -ra CODES <<< "$SYMBOLS"
+          for code in "${CODES[@]}"; do
+            tmp="data/realtime/.${code}.tmp.json"
+            out="data/realtime/${code}.json"
+            curl -fL --connect-timeout 15 --max-time 90 --retry 3 --retry-delay 2 \
+              "$RENDER_BASE_URL/public/analysis-data/${code}" -o "$tmp"
+            CODE="$code" TMP="$tmp" python - <<'PY'
+          import datetime as dt, json, os
+          from zoneinfo import ZoneInfo
+          code, path = os.environ['CODE'], os.environ['TMP']
+          with open(path, encoding='utf-8') as f:
+              d = json.load(f)
+          assert str(d.get('symbol','')).startswith(code), f'symbol mismatch: {d.get("symbol")}'
+          assert d.get('intraday') or d.get('daily'), 'snapshot contains no market data'
+          d.setdefault('bridge_meta', {})
+          d['bridge_meta'].update({
+              'schema_version': 1,
+              'requested_symbol': code,
+              'snapshot_at': dt.datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
+              'transport': 'tencent/render -> github-actions -> github-json',
+              'strategy_parameters_changed': False,
+          })
+          with open(path, 'w', encoding='utf-8') as f:
+              json.dump(d, f, ensure_ascii=False, separators=(',', ':'))
+          PY
+            mv "$tmp" "$out"
+          done
+
+      - name: Build stable manifest
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          python - <<'PY'
+          import datetime as dt, glob, json, os
+          from zoneinfo import ZoneInfo
+          items=[]
+          for path in sorted(glob.glob('data/realtime/*.json')):
+              if path.endswith('/manifest.json'):
+                  continue
+              with open(path, encoding='utf-8') as f:
+                  d=json.load(f)
+              meta=d.get('meta') or {}
+              intraday=d.get('intraday') or {}
+              metrics=intraday.get('metrics') or {}
+              items.append({
+                  'symbol': d.get('symbol'), 'name': d.get('name'),
+                  'path': path, 'generated_at': d.get('generated_at'),
+                  'intraday_as_of': meta.get('intraday_as_of') or intraday.get('as_of'),
+                  'current': metrics.get('current'),
+                  'partial': meta.get('partial', False),
+              })
+          manifest={
+              'schema_version':1,
+              'updated_at':dt.datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
+              'strategy_contract':'existing-strict-entry-v1',
+              'parameters_changed':False,
+              'stocks':items,
+          }
+          with open('data/realtime/manifest.json','w',encoding='utf-8') as f:
+              json.dump(manifest,f,ensure_ascii=False,separators=(',',':'))
+          PY
+
+      - name: Commit snapshots safely
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/realtime/
+          if git diff --cached --quiet; then
+            echo 'No snapshot change.'
+            exit 0
+          fi
+          git commit -m "Update realtime stock snapshots"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying..."
+            sleep $((attempt * 3))
+          done
+          exit 1
