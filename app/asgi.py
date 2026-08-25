@@ -8,6 +8,7 @@ from fastapi import HTTPException, Path, Query
 from fastapi.responses import HTMLResponse
 
 from .main import app, intraday_snapshot
+from .analysis_data import unified_analysis_data
 from .mcp_server import mcp, mcp_app
 
 
@@ -52,74 +53,51 @@ def _intraday_html(snapshot: dict, symbol: str) -> HTMLResponse:
     as_of = escape(str(snapshot.get("as_of") or ""))
 
     html = f"""<!doctype html>
-<html lang=\"zh-CN\">
-<head>
-<meta charset=\"utf-8\">
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<meta name=\"robots\" content=\"index,follow\">
-<title>{title} 分时行情</title>
-<style>
-body{{font-family:system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:24px;line-height:1.5;color:#111}}
-main{{max-width:980px;margin:auto}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:16px 0}}
-.card{{border:1px solid #ddd;border-radius:10px;padding:12px}}
-.label{{font-size:12px;color:#666}} .value{{font-size:20px;font-weight:650}}
-table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{padding:7px;border-bottom:1px solid #eee;text-align:right}} th:first-child,td:first-child{{text-align:left}}
-small{{color:#666}}
-</style>
-</head>
-<body><main>
-<h1>{title} <small>{normalized}</small></h1>
-<p>更新时间：{as_of} ｜ 数据源：{source}</p>
-<div class=\"grid\">
-<div class=\"card\"><div class=\"label\">当前价</div><div class=\"value\">{value('current')}</div></div>
-<div class=\"card\"><div class=\"label\">VWAP</div><div class=\"value\">{value('vwap')}</div></div>
-<div class=\"card\"><div class=\"label\">日内高点</div><div class=\"value\">{value('session_high')}</div></div>
-<div class=\"card\"><div class=\"label\">日内低点</div><div class=\"value\">{value('session_low')}</div></div>
-<div class=\"card\"><div class=\"label\">15分钟变化%</div><div class=\"value\">{value('change_15m_pct')}</div></div>
-<div class=\"card\"><div class=\"label\">30分钟变化%</div><div class=\"value\">{value('change_30m_pct')}</div></div>
-<div class=\"card\"><div class=\"label\">近5分钟量比</div><div class=\"value\">{value('last_5m_volume_ratio_vs_prev20')}</div></div>
-<div class=\"card\"><div class=\"label\">最近3根低点抬高</div><div class=\"value\">{value('higher_lows_last_3_bars')}</div></div>
-</div>
-<h2>最近1分钟数据</h2>
-<table><thead><tr><th>时间</th><th>开</th><th>高</th><th>低</th><th>收</th><th>量</th></tr></thead><tbody>{rows}</tbody></table>
-<p><small>仅供行情研究，不构成投资建议。</small></p>
-</main></body></html>"""
+<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"index,follow\"><title>{title} 分时行情</title>
+<style>body{{font-family:system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:24px;line-height:1.5;color:#111}}main{{max-width:980px;margin:auto}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:16px 0}}.card{{border:1px solid #ddd;border-radius:10px;padding:12px}}.label{{font-size:12px;color:#666}}.value{{font-size:20px;font-weight:650}}table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{padding:7px;border-bottom:1px solid #eee;text-align:right}}th:first-child,td:first-child{{text-align:left}}small{{color:#666}}</style></head>
+<body><main><h1>{title} <small>{normalized}</small></h1><p>更新时间：{as_of} ｜ 数据源：{source}</p>
+<div class=\"grid\"><div class=\"card\"><div class=\"label\">当前价</div><div class=\"value\">{value('current')}</div></div><div class=\"card\"><div class=\"label\">VWAP</div><div class=\"value\">{value('vwap')}</div></div><div class=\"card\"><div class=\"label\">日内高点</div><div class=\"value\">{value('session_high')}</div></div><div class=\"card\"><div class=\"label\">日内低点</div><div class=\"value\">{value('session_low')}</div></div><div class=\"card\"><div class=\"label\">15分钟变化%</div><div class=\"value\">{value('change_15m_pct')}</div></div><div class=\"card\"><div class=\"label\">30分钟变化%</div><div class=\"value\">{value('change_30m_pct')}</div></div><div class=\"card\"><div class=\"label\">近5分钟量比</div><div class=\"value\">{value('last_5m_volume_ratio_vs_prev20')}</div></div><div class=\"card\"><div class=\"label\">最近3根低点抬高</div><div class=\"value\">{value('higher_lows_last_3_bars')}</div></div></div>
+<h2>最近1分钟数据</h2><table><thead><tr><th>时间</th><th>开</th><th>高</th><th>低</th><th>收</th><th>量</th></tr></thead><tbody>{rows}</tbody></table><p><small>仅供行情研究，不构成投资建议。</small></p></main></body></html>"""
     return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.get("/public/intraday", operation_id="publicIntraday", include_in_schema=True)
-def public_intraday(
-    symbol: str = Query(..., min_length=6, max_length=20, description="A-share code, e.g. 001309"),
-    bars: int = Query(240, ge=30, le=600, description="Minute bars requested"),
-):
+def public_intraday(symbol: str = Query(..., min_length=6, max_length=20), bars: int = Query(240, ge=30, le=600)):
     return _load_public_intraday(symbol, bars)
 
 
 @app.get("/public/intraday/view", response_class=HTMLResponse, include_in_schema=False)
-def public_intraday_view(
-    symbol: str = Query(..., min_length=6, max_length=20, description="A-share code, e.g. 001309"),
-    bars: int = Query(240, ge=30, le=600, description="Minute bars requested"),
-):
+def public_intraday_view(symbol: str = Query(..., min_length=6, max_length=20), bars: int = Query(240, ge=30, le=600)):
     return _intraday_html(_load_public_intraday(symbol, bars), symbol)
 
 
 @app.get("/public/intraday/{symbol}", operation_id="publicIntradayFixed", include_in_schema=True)
-def public_intraday_fixed(
-    symbol: str = Path(..., description="Six-digit A-share code, e.g. 001309"),
-):
-    """Stable, query-free public JSON URL backed by the live Tencent-first pipeline."""
+def public_intraday_fixed(symbol: str = Path(...)):
     symbol = _validate_fixed_symbol(symbol)
     return _load_public_intraday(symbol, 240)
 
 
 @app.get("/public/intraday/{symbol}/view", response_class=HTMLResponse, include_in_schema=False)
-def public_intraday_fixed_view(
-    symbol: str = Path(..., description="Six-digit A-share code, e.g. 001309"),
-):
-    """Stable, query-free human-readable intraday page for crawlers and browsers."""
+def public_intraday_fixed_view(symbol: str = Path(...)):
     symbol = _validate_fixed_symbol(symbol)
     return _intraday_html(_load_public_intraday(symbol, 240), symbol)
+
+
+@app.get("/public/analysis-data/{symbol}", operation_id="publicAnalysisData", include_in_schema=True)
+def public_analysis_data(symbol: str = Path(..., description="Six-digit A-share code, e.g. 001309")):
+    """Stable unified data entrypoint for the existing strict-entry strategy.
+
+    This endpoint changes only data transport. It reuses the existing intraday
+    pipeline and services._indicators without changing strategy parameters.
+    """
+    symbol = _validate_fixed_symbol(symbol)
+    try:
+        payload = unified_analysis_data(symbol)
+        return payload
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Unified market data request failed: {exc}") from exc
 
 
 @asynccontextmanager
