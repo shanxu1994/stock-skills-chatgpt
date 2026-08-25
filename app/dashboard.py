@@ -5,6 +5,8 @@ from datetime import datetime
 import re
 from typing import Any, Callable
 
+from .t_strategy import TState, evaluate_t_state
+
 
 DASHBOARD_STOCKS = (
     {"symbol": "001309", "name": "德明利"},
@@ -19,7 +21,7 @@ def _price(value: float) -> float:
 
 
 def build_strict_signals(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Build explainable signals using only the existing intraday metrics."""
+    """Build explainable signals while preserving the dashboard response shape."""
     metrics = snapshot["metrics"]
     current = float(metrics["current"])
     high = float(metrics["session_high"])
@@ -38,20 +40,35 @@ def build_strict_signals(snapshot: dict[str, Any]) -> dict[str, Any]:
     invalidation = max(0.01, low - day_range * 0.08)
     breakout = high + max(current * 0.001, day_range * 0.04)
 
-    if vwap is None:
-        t_status, t_label = "wait", "等待有效 VWAP"
-        t_reasons = ["成交数据暂不足以计算 VWAP"]
-    elif current <= vwap * 1.006 and higher_lows and (change_15m is None or change_15m > -0.8):
-        t_status, t_label = "observe", "做T买入观察"
-        t_reasons = ["价格靠近 VWAP", "最近3根低点抬高"]
-    elif current > vwap * 1.015 or (change_15m is not None and change_15m > 1.5):
-        t_status, t_label = "avoid", "禁止追高"
-        t_reasons = ["价格明显偏离 VWAP 或短线涨速过快"]
-    else:
-        t_status, t_label = "wait", "等待承接"
-        t_reasons = ["低点结构或价格位置尚未形成共振"]
-    if volume_ratio is not None:
-        t_reasons.append(f"近5分钟量比 {volume_ratio:.2f}")
+    minute_bars = snapshot.get("one_minute_bars") or []
+    state_result = evaluate_t_state(minute_bars)
+    if not minute_bars:
+        # Compatibility for callers that only provide aggregate metrics. Being
+        # in the price zone is WATCH at most; aggregate data can never confirm.
+        if vwap is None:
+            fallback_state = TState.WAIT
+        elif current > vwap * 1.025 or (change_15m is not None and change_15m < -1.2):
+            fallback_state = TState.NO_TRADE
+        elif abs(current / vwap - 1) <= 0.012:
+            fallback_state = TState.WATCH
+        else:
+            fallback_state = TState.WAIT
+        state_result = {
+            "state": fallback_state.value,
+            "structure": None,
+            "score": 0,
+            "conditions": {},
+            "reasons": ["仅有汇总指标，价格到区只观察，分钟结构确认后才可触发"],
+        }
+    labels = {
+        TState.WAIT.value: "WAIT · 等待结构",
+        TState.WATCH.value: "WATCH · 观察确认",
+        TState.CONFIRMED.value: "CONFIRMED · 共振确认",
+        TState.NO_TRADE.value: "NO_TRADE · 禁止交易",
+    }
+    t_status = state_result["state"]
+    t_label = labels[t_status]
+    t_reasons = list(state_result["reasons"])
 
     positive_momentum = sum(value is not None and value > 0 for value in (change_15m, change_30m))
     if vwap is not None and current >= vwap and higher_lows and positive_momentum >= 1:
@@ -68,13 +85,17 @@ def build_strict_signals(snapshot: dict[str, Any]) -> dict[str, Any]:
         "t_system": {
             "status": t_status,
             "label": t_label,
+            "state": t_status,
+            "structure": state_result.get("structure"),
+            "resonance_score": state_result.get("score", 0),
+            "conditions": state_result.get("conditions", {}),
             "buy_zone": [_price(support), _price(max(support, buy_upper))],
             "reduce_zone": [_price(reduce_low), _price(high)],
             "invalidation": _price(invalidation),
             "reasons": t_reasons,
         },
         "trend_system": {
-            "status": trend_status,
+            "status": trend_status.upper(),
             "label": trend_label,
             "trial_reference": _price(vwap if vwap is not None else current),
             "breakout_confirmation": _price(breakout),
