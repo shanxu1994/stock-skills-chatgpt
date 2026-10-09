@@ -1,6 +1,10 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import pandas as pd
 from fastapi.testclient import TestClient
 
-from app.main import app, _fetch_tencent_1m, intraday_snapshot
+from app.main import app, _fetch_tencent_1m, _intraday_metrics, _validated_session_frame, intraday_snapshot
 from app import services
 from app.dashboard import build_dashboard_payload, build_strict_signals, dashboard_symbols
 from app.services import normalize_symbol
@@ -91,12 +95,11 @@ def test_tencent_parser_converts_cumulative_volume_and_amount(monkeypatch):
 
 
 def test_intraday_snapshot_uses_tencent_first(monkeypatch):
-    import pandas as pd
-
     frame = pd.DataFrame([
         {"time": "2026-08-24 09:30", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 100, "amount": 100000},
         {"time": "2026-08-24 09:31", "open": 10, "high": 10.1, "low": 10, "close": 10.1, "volume": 100, "amount": 101000},
     ])
+    monkeypatch.setattr("app.main._shanghai_now", lambda: datetime(2026, 8, 24, 9, 31, 30, tzinfo=ZoneInfo("Asia/Shanghai")))
     monkeypatch.setattr("app.main._fetch_tencent_1m", lambda normalized, bars: (frame, "德明利"))
     result = intraday_snapshot("001309", 240)
     assert result["source"] == "tencent_public_http"
@@ -104,17 +107,63 @@ def test_intraday_snapshot_uses_tencent_first(monkeypatch):
 
 
 def test_intraday_snapshot_falls_back_when_tencent_fails(monkeypatch):
-    import pandas as pd
-
     frame = pd.DataFrame([
         {"time": "2026-08-24 09:30", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 100, "amount": 100000},
         {"time": "2026-08-24 09:31", "open": 10, "high": 10.1, "low": 10, "close": 10.1, "volume": 100, "amount": 101000},
     ])
+    monkeypatch.setattr("app.main._shanghai_now", lambda: datetime(2026, 8, 24, 9, 31, 30, tzinfo=ZoneInfo("Asia/Shanghai")))
     monkeypatch.setattr("app.main._fetch_tencent_1m", lambda *args: (_ for _ in ()).throw(RuntimeError("down")))
     monkeypatch.setattr("app.main._fetch_sina_1m", lambda normalized, bars: (frame, None))
     result = intraday_snapshot("001309", 240)
     assert result["source"] == "sina_public_http"
     assert result["fallback"] is True
+
+
+def test_after_close_rows_are_removed_before_metrics():
+    frame = pd.DataFrame([
+        {"time": "2026-10-09 09:30", "open": 9, "high": 10, "low": 9, "close": 10, "volume": 100, "amount": 100000},
+        {"time": "2026-10-09 15:00", "open": 10, "high": 12, "low": 10, "close": 11, "volume": 100, "amount": 110000},
+        {"time": "2026-10-09 15:01", "open": 11, "high": 11, "low": 11, "close": 11, "volume": 0, "amount": 0},
+        {"time": "2026-10-09 15:30", "open": 11, "high": 11, "low": 11, "close": 11, "volume": 0, "amount": 0},
+    ])
+    clean, freshness = _validated_session_frame(frame, datetime(2026, 10, 9, 15, 32, tzinfo=ZoneInfo("Asia/Shanghai")))
+    metrics = _intraday_metrics(clean)
+    assert clean["time"].tolist() == ["2026-10-09 09:30", "2026-10-09 15:00"]
+    assert freshness["last_trade_at"] == "2026-10-09T15:00:00+08:00"
+    assert freshness["market_status"] == "market_closed"
+    assert freshness["is_tradable"] is False
+    assert metrics["session_low"] == 9.0
+    assert metrics["session_high"] == 12.0
+
+
+def test_official_quote_extremes_override_single_price_minute_extremes():
+    frame = pd.DataFrame([
+        {"time": "2026-10-09 09:30", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 100, "amount": 100000},
+        {"time": "2026-10-09 15:00", "open": 10, "high": 11, "low": 10, "close": 11, "volume": 100, "amount": 110000},
+    ])
+    frame.attrs["official_session_high"] = 12.0
+    frame.attrs["official_session_low"] = 9.0
+    clean, _ = _validated_session_frame(frame, datetime(2026, 10, 9, 15, 32, tzinfo=ZoneInfo("Asia/Shanghai")))
+    metrics = _intraday_metrics(clean)
+    assert metrics["session_high"] == 12.0
+    assert metrics["session_low"] == 9.0
+
+
+def test_stale_primary_falls_back_to_fresh_secondary(monkeypatch):
+    stale = pd.DataFrame([{"time": "2026-10-09 10:00", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 100, "amount": 100000}])
+    fresh = pd.DataFrame([
+        {"time": "2026-10-09 10:09", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 100, "amount": 100000},
+        {"time": "2026-10-09 10:10", "open": 10, "high": 10.1, "low": 10, "close": 10.1, "volume": 100, "amount": 101000},
+    ])
+    monkeypatch.setattr("app.main._shanghai_now", lambda: datetime(2026, 10, 9, 10, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai")))
+    monkeypatch.setattr("app.main._fetch_tencent_1m", lambda *args: (stale, "德明利"))
+    monkeypatch.setattr("app.main._fetch_sina_1m", lambda *args: (fresh, "德明利"))
+    result = intraday_snapshot("001309", 240)
+    assert result["source"] == "sina_public_http"
+    assert result["freshness_status"] == "live"
+    assert result["is_tradable"] is True
+    assert result["source_attempts"][0]["ok"] is False
+    assert "Stale intraday data" in result["source_attempts"][0]["error"]
 
 
 def test_health_route_with_auth_env_does_not_require_key(monkeypatch):

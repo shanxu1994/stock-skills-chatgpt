@@ -6,7 +6,7 @@ indicator function. Strategy thresholds and indicator formulas are not changed.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -116,6 +116,29 @@ def _fetch_akshare_daily(normalized: str, days: int) -> tuple[pd.DataFrame, str 
     return _normalize_daily_frame(frame, days), None
 
 
+def _fetch_tushare_qfq_daily(normalized: str, days: int) -> tuple[pd.DataFrame, str | None]:
+    """Fetch Tushare daily bars and convert them to forward-adjusted prices."""
+    pro = stock_services._tushare_client()
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=max(days * 3, 180))
+    params = {"ts_code": normalized, "start_date": start.strftime("%Y%m%d"), "end_date": end.strftime("%Y%m%d")}
+    frame = pro.daily(**params)
+    factors = pro.adj_factor(**params)
+    if frame is None or frame.empty or factors is None or factors.empty:
+        raise RuntimeError("Tushare returned no daily bars or adjustment factors")
+    merged = frame.merge(factors[["trade_date", "adj_factor"]], on="trade_date", how="inner").sort_values("trade_date")
+    if merged.empty:
+        raise RuntimeError("Tushare daily bars could not be matched to adjustment factors")
+    latest_factor = float(merged.iloc[-1]["adj_factor"])
+    if latest_factor <= 0:
+        raise RuntimeError("Tushare returned an invalid latest adjustment factor")
+    ratio = pd.to_numeric(merged["adj_factor"], errors="coerce") / latest_factor
+    for column in ["open", "high", "low", "close"]:
+        merged[column] = pd.to_numeric(merged[column], errors="coerce") * ratio
+    merged = merged.rename(columns={"vol": "volume"})
+    return _normalize_daily_frame(merged, days), None
+
+
 def daily_snapshot(symbol: str, days: int = 120) -> dict[str, Any]:
     market, normalized = stock_services.normalize_symbol(symbol)
     if market != "a":
@@ -125,6 +148,7 @@ def daily_snapshot(symbol: str, days: int = 120) -> dict[str, Any]:
         ("tencent_public_http", _fetch_tencent_daily),
         ("eastmoney_public_http", _fetch_eastmoney_daily),
         ("akshare_public", _fetch_akshare_daily),
+        ("tushare_qfq", _fetch_tushare_qfq_daily),
     ]
     attempts: list[dict[str, Any]] = []
     frame = None
@@ -140,14 +164,8 @@ def daily_snapshot(symbol: str, days: int = 120) -> dict[str, Any]:
             attempts.append({"source": source_name, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     if frame is None or source is None:
-        try:
-            frame, name = stock_services._a_share_history(normalized, days)
-            source = "tushare_compatibility_fallback"
-            attempts.append({"source": source, "ok": True})
-        except Exception as exc:
-            attempts.append({"source": "tushare_compatibility_fallback", "ok": False, "error": f"{type(exc).__name__}: {exc}"})
-            details = "; ".join(f"{item['source']} -> {item.get('error', 'ok')}" for item in attempts)
-            raise RuntimeError(f"All daily providers failed for {normalized}: {details}") from exc
+        details = "; ".join(f"{item['source']} -> {item.get('error', 'ok')}" for item in attempts)
+        raise RuntimeError(f"All daily providers failed for {normalized}: {details}")
 
     if not name:
         try:
@@ -178,6 +196,7 @@ def daily_snapshot(symbol: str, days: int = 120) -> dict[str, Any]:
         "source": source,
         "fallback": bool(failed),
         "source_attempts": attempts,
+        "adjustment": "qfq",
         "indicators": indicators,
         "recent_daily_bars": recent_bars,
         "data_points": len(frame),
@@ -229,7 +248,7 @@ def unified_analysis_data(symbol: str) -> dict[str, Any]:
     return {
         "symbol": daily.get("symbol") or intraday.get("symbol") or normalized,
         "name": name,
-        "generated_at": datetime.now().astimezone().isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "strategy_contract": {
             "version": STRICT_POLICY_VERSION,
             "indicator_engine": "services._indicators",
@@ -246,6 +265,10 @@ def unified_analysis_data(symbol: str) -> dict[str, Any]:
             "daily_source": daily.get("source"),
             "daily_as_of": daily.get("as_of"),
             "intraday_fallback": intraday.get("fallback"),
+            "market_status": intraday.get("market_status"),
+            "freshness_status": intraday.get("freshness_status"),
+            "quote_age_seconds": intraday.get("quote_age_seconds"),
+            "is_tradable": intraday.get("is_tradable", False),
             "daily_fallback": daily.get("fallback"),
             "intraday_error": intraday.get("error"),
             "daily_error": daily.get("error"),

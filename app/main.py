@@ -7,11 +7,14 @@ from .auth import require_api_key
 from .models import LhbRequest, MarketRequest, StockAnalyzeRequest, TushareQueryRequest
 from . import services as stock_services
 from .services import analyze_stocks, lhb_rank, sector_rank, tushare_query
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import json
 import logging
+import os
 import re
+import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
@@ -19,6 +22,8 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 _DASHBOARD_FILE = Path(__file__).with_name("dashboard.html")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_LIVE_MAX_AGE_SECONDS = 90
 
 
 class HealthResponse(BaseModel):
@@ -48,6 +53,17 @@ app.add_middleware(
 @app.get("/health", operation_id="healthCheck", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+@app.get("/version", include_in_schema=False)
+def version():
+    """Expose deploy identity without leaking secrets."""
+    return {
+        "git_commit": os.getenv("RENDER_GIT_COMMIT"),
+        "git_branch": os.getenv("RENDER_GIT_BRANCH"),
+        "service": os.getenv("RENDER_SERVICE_NAME"),
+        "schema_version": 2,
+    }
 
 
 @app.get("/dashboard", include_in_schema=False)
@@ -186,7 +202,6 @@ def _public_get(url: str, *, params: dict | None = None, referer: str) -> httpx.
             "Accept": "application/json,text/plain,*/*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
             "Referer": referer,
-            "Connection": "close",
         },
     )
     response.raise_for_status()
@@ -243,7 +258,14 @@ def _fetch_tencent_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | N
     qt = node.get("qt") or {}
     quote = qt.get(symbol) or []
     name = str(quote[1]) if len(quote) > 1 and quote[1] else None
-    return frame.tail(bars).copy(), name
+    # Tencent exposes only one price per minute; retain the official quote
+    # extremes so session metrics include intraminute highs and lows.
+    try:
+        frame.attrs["official_session_high"] = float(quote[33])
+        frame.attrs["official_session_low"] = float(quote[34])
+    except (IndexError, TypeError, ValueError):
+        pass
+    return frame.copy(), name
 
 
 def _fetch_sina_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | None]:
@@ -251,7 +273,7 @@ def _fetch_sina_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | None
     symbol = _public_symbol(normalized)
     response = _public_get(
         "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_data=/CN_MarketDataService.getKLineData",
-        params={"symbol": symbol, "scale": 1, "ma": "no", "datalen": bars},
+        params={"symbol": symbol, "scale": 1, "ma": "no", "datalen": max(bars, 300)},
         referer="https://finance.sina.com.cn/",
     )
     match = re.search(r"=\s*\(?\s*(\[.*\])\s*\)?\s*;?\s*$", response.text, flags=re.S)
@@ -277,7 +299,7 @@ def _fetch_sina_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | None
     frame = pd.DataFrame(parsed)
     if frame.empty:
         raise RuntimeError("Sina returned no parseable minute bars")
-    return frame.tail(bars).copy(), None
+    return frame.copy(), None
 
 
 def _fetch_eastmoney_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | None]:
@@ -288,7 +310,7 @@ def _fetch_eastmoney_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str |
         "secid": secid,
         "klt": 1,
         "fqt": 1,
-        "lmt": bars,
+        "lmt": max(bars, 300),
         "end": "20500101",
         "iscca": 1,
         "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
@@ -336,7 +358,82 @@ def _fetch_akshare_1m(normalized: str, bars: int) -> tuple[pd.DataFrame, str | N
     missing = [col for col in required if col not in frame.columns]
     if missing:
         raise RuntimeError(f"AkShare minute data missing columns: {missing}")
-    return frame[required].tail(bars).copy(), None
+    return frame[required].copy(), None
+
+
+def _shanghai_now() -> datetime:
+    return datetime.now(_SHANGHAI)
+
+
+def _market_status(now: datetime) -> str:
+    """Return the A-share exchange phase using Shanghai local time."""
+    if now.weekday() >= 5:
+        return "market_closed"
+    minute = now.hour * 60 + now.minute
+    if minute < 570:
+        return "pre_open"
+    if minute <= 690:
+        return "open"
+    if minute < 780:
+        return "lunch_break"
+    if minute <= 900:
+        return "open"
+    return "market_closed"
+
+
+def _validated_session_frame(frame: pd.DataFrame, now: datetime | None = None) -> tuple[pd.DataFrame, dict]:
+    """Normalize one provider and reject data unsafe for live signals."""
+    now = (now or _shanghai_now()).astimezone(_SHANGHAI)
+    work = frame.copy()
+    if "time" not in work:
+        raise RuntimeError("Intraday data missing time column")
+    work["_time"] = pd.to_datetime(work["time"], errors="coerce")
+    work = work.dropna(subset=["_time"]).sort_values("_time").drop_duplicates("_time", keep="last")
+    if work.empty:
+        raise RuntimeError("Intraday data has no valid timestamps")
+
+    minute = work["_time"].dt.hour * 60 + work["_time"].dt.minute
+    in_session = ((minute >= 570) & (minute <= 690)) | ((minute >= 780) & (minute <= 900))
+    work = work.loc[in_session].copy()
+    if work.empty:
+        raise RuntimeError("Intraday data has no rows inside A-share trading sessions")
+
+    latest_date = work["_time"].dt.date.max()
+    work = work.loc[work["_time"].dt.date == latest_date].copy()
+    last_naive = work.iloc[-1]["_time"].to_pydatetime()
+    last_trade = last_naive.replace(tzinfo=_SHANGHAI)
+    age_seconds = max(0.0, (now - last_trade).total_seconds())
+    phase = _market_status(now)
+
+    if phase == "open":
+        if last_trade.date() != now.date():
+            raise RuntimeError(
+                f"Stale intraday data: latest trade date {last_trade.date()} != Shanghai date {now.date()}"
+            )
+        if last_trade > now + timedelta(seconds=60):
+            raise RuntimeError(f"Invalid future intraday timestamp: {last_trade.isoformat()}")
+        if age_seconds > _LIVE_MAX_AGE_SECONDS:
+            raise RuntimeError(
+                f"Stale intraday data: latest bar age {age_seconds:.0f}s exceeds {_LIVE_MAX_AGE_SECONDS}s"
+            )
+        freshness = "live"
+        tradable = True
+    elif phase == "lunch_break":
+        freshness = "paused"
+        tradable = False
+    else:
+        freshness = "closed"
+        tradable = False
+
+    work["time"] = work["_time"].dt.strftime("%Y-%m-%d %H:%M")
+    work = work.drop(columns=["_time"])
+    return work, {
+        "market_status": phase,
+        "freshness_status": freshness,
+        "quote_age_seconds": round(age_seconds, 1),
+        "last_trade_at": last_trade.isoformat(),
+        "is_tradable": tradable,
+    }
 
 
 def _intraday_metrics(frame: pd.DataFrame) -> dict:
@@ -351,6 +448,12 @@ def _intraday_metrics(frame: pd.DataFrame) -> dict:
     current = float(last["close"])
     session_high = float(frame["high"].max())
     session_low = float(frame["low"].min())
+    official_high = frame.attrs.get("official_session_high")
+    official_low = frame.attrs.get("official_session_low")
+    if official_high is not None and float(official_high) > 0:
+        session_high = max(session_high, float(official_high))
+    if official_low is not None and float(official_low) > 0:
+        session_low = min(session_low, float(official_low))
 
     total_volume = float(frame["volume"].sum())
     total_amount = float(frame["amount"].sum()) if "amount" in frame else 0.0
@@ -434,16 +537,28 @@ def intraday_snapshot(symbol: str, bars: int):
         ("akshare_public", _fetch_akshare_1m),
     ]
     attempts = []
-    frame = name = source = None
+    frame = name = source = freshness = None
     for provider_name, provider in providers:
+        started = time.perf_counter()
         try:
-            frame, name = provider(normalized, bars)
+            candidate, name = provider(normalized, bars)
+            frame, freshness = _validated_session_frame(candidate)
             source = provider_name
-            attempts.append({"source": provider_name, "ok": True})
+            attempts.append({
+                "source": provider_name, "ok": True,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                "latest_at": freshness["last_trade_at"],
+                "quote_age_seconds": freshness["quote_age_seconds"],
+            })
+            logger.info("Intraday provider accepted symbol=%s source=%s freshness=%s", normalized, provider_name, freshness)
             break
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            attempts.append({"source": provider_name, "ok": False, "error": error})
+            attempts.append({
+                "source": provider_name, "ok": False,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                "error": error,
+            })
             logger.warning("Intraday provider %s failed for %s: %s", provider_name, normalized, error)
 
     if frame is None or source is None:
@@ -486,10 +601,12 @@ def intraday_snapshot(symbol: str, bars: int):
         "fallback": fallback,
         "fallback_reason": fallback_reason,
         "source_attempts": attempts,
+        **(freshness or {}),
         "metrics": metrics,
         "one_minute_bars": one_min,
         "five_minute_bars": _resample_5m(frame),
         "bars_received": len(frame),
+        "bars_requested": bars,
         "error": None,
         "disclaimer": "Market research only; not investment advice.",
     }

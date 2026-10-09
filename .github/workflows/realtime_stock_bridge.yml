@@ -17,8 +17,8 @@ on:
         required: false
         default: 'main'
   schedule:
-    - cron: '*/5 1-3 * * 1-5'
-    - cron: '*/5 5-7 * * 1-5'
+    - cron: '2-57/5 1-3 * * 1-5'
+    - cron: '2-57/5 5-7 * * 1-5'
 
 permissions:
   contents: write
@@ -78,6 +78,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         env:
           SYMBOLS: ${{ steps.gate.outputs.symbols }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           mkdir -p data/realtime
@@ -93,6 +94,11 @@ jobs:
           assert str(d.get('symbol','')).startswith(code), f'symbol mismatch: {d.get("symbol")}'
           now=dt.datetime.now(ZoneInfo('Asia/Shanghai'))
           meta=d.setdefault('meta',{}); daily=d.get('daily') or {}
+          intraday=d.get('intraday') or {}
+          if os.environ.get('EVENT_NAME') == 'schedule':
+              assert intraday.get('freshness_status') == 'live', f"non-live scheduled snapshot: {intraday.get('freshness_status')}"
+              assert intraday.get('is_tradable') is True, 'scheduled snapshot is not tradable'
+              assert float(intraday.get('quote_age_seconds', 999999)) <= 120, 'scheduled snapshot is stale'
           reused=False
           if not meta.get('daily_available', daily.get('available',True)) and os.path.exists(out):
               try:
@@ -106,7 +112,7 @@ jobs:
                       d['daily_cache']={'reused':True,'reason':'live_daily_providers_failed','live_error':failure,'cached_as_of':old_daily.get('as_of')}
               except Exception as exc:
                   d['daily_cache']={'reused':False,'error':f'{type(exc).__name__}: {exc}'}
-          d.setdefault('bridge_meta',{}).update({'schema_version':1,'requested_symbol':code,'snapshot_at':now.isoformat(),'transport':'tencent/render -> github-actions -> github-json','strategy_parameters_changed':False,'daily_cache_reused':reused})
+          d.setdefault('bridge_meta',{}).update({'schema_version':2,'requested_symbol':code,'snapshot_at':now.isoformat(),'transport':'validated-market-data/render -> github-actions -> github-json','strategy_parameters_changed':False,'daily_cache_reused':reused})
           with open(path,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,separators=(',',':'))
           PY
             mv "$tmp" "$out"

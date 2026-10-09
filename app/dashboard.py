@@ -20,6 +20,12 @@ def _price(value: float) -> float:
 
 def build_strict_signals(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Build explainable signals using only the existing intraday metrics."""
+    if snapshot.get("is_tradable") is False:
+        reason = f"行情状态为 {snapshot.get('market_status') or '非交易时段'}，禁止生成盘中交易信号"
+        return {
+            "t_system": {"status": "wait", "label": "行情非实时", "buy_zone": [None, None], "reduce_zone": [None, None], "invalidation": None, "reasons": [reason]},
+            "trend_system": {"status": "wait", "label": "行情非实时", "trial_reference": None, "breakout_confirmation": None, "add_condition": "等待 is_tradable=true 且 freshness_status=live", "invalidation": None, "reasons": [reason]},
+        }
     metrics = snapshot["metrics"]
     current = float(metrics["current"])
     high = float(metrics["session_high"])

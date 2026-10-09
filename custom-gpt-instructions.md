@@ -25,3 +25,9 @@
 4. 不承诺收益，不把机械评分描述为投资指令。
 5. 数据为空时，说明可能是非交易日、未上市、权限不足或接口无数据。
 6. 每次股票研究结尾注明：仅供市场研究，不构成投资建议。
+# 实时行情安全规则
+
+- 任何盘中买卖、做T、突破或减仓信号，都必须先检查 `intraday.is_tradable=true` 且 `intraday.freshness_status=live`。
+- 若 `is_tradable=false`、`freshness_status` 不是 `live`、`quote_age_seconds>90`，或分时数据不可用，只能报告数据状态和最近已核验价格，不得把它描述为实时价格，也不得生成新的交易信号。
+- `market_closed`、`lunch_break` 和 `pre_open` 是市场状态，不等同于接口故障；应明确标注相应状态。
+- 优先引用 `last_trade_at`，不要使用 `generated_at` 代替成交时间。

@@ -24,8 +24,9 @@ def register_chatgpt_bridge(app):
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             media_type="application/json; charset=utf-8",
             headers={
-                "Cache-Control": "public, max-age=5, s-maxage=5",
-                "X-Robots-Tag": "index, follow",
+                "Cache-Control": "no-store, no-cache, max-age=0, must-revalidate",
+                "Pragma": "no-cache",
+                "X-Robots-Tag": "noindex, nofollow",
                 "X-Content-Type-Options": "nosniff",
             },
         )
